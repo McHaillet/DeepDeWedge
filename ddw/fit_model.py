@@ -45,9 +45,6 @@ def fit_model(
     subtomo_size: Annotated[
         int, typer.Option(help="Size of the cubic subtomograms used for model fitting.")
     ],
-    mw_angle: Annotated[
-        float, typer.Option(help="Width of the missing wedge in degrees.")
-    ],
     gpu: Annotated[List[int], typer.Option(help="Which GPU(s) to use for model fitting. Example: gpu=0 uses the first GPU, gpu=[0,1] uses the first two GPUs.")],
     num_workers: Annotated[
         int,
@@ -71,6 +68,12 @@ def fit_model(
         Optional[str],
         typer.Option(
             help="Path to the directory where the model checkpoints and logs will be saved. If logdir is not provided, logdir is set to '{project_dir}/logs'."
+        ),
+    ] = None,
+    mw_angle: Annotated[
+        Optional[float],
+        typer.Option(
+            help="Width of the missing wedge in degrees. Required unless subtomo_dir contains a 'ctf' subdirectory (i.e. '{subtomo_dir}/fitting_subtomos/ctf/{index}.pt' and, if present, '{subtomo_dir}/val_subtomos/ctf/{index}.pt', each a tensor of the same shape as the corresponding subtomo0/subtomo1 with values in [0, 1]), in which case the per-subtomogram 3D-CTF/mask found there is used instead and this option is ignored."
         ),
     ] = None,
     logger: Annotated[
@@ -132,6 +135,12 @@ def fit_model(
             raise ValueError(
                 "If project_dir is not provided, subtomo_dir must be provided."
             )
+    subtomo_dir_has_ctf = os.path.exists(f"{subtomo_dir}/fitting_subtomos/ctf")
+    if not subtomo_dir_has_ctf and mw_angle is None:
+        raise ValueError(
+            "mw_angle must be provided unless subtomo_dir contains a "
+            "'fitting_subtomos/ctf' directory."
+        )
     # setup logdir
     if logdir is None:
         if project_dir is not None:

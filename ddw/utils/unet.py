@@ -119,8 +119,10 @@ class LitUnet3D(pl.LightningModule):
         subtomo_dim = dataset[0]["model_input"].shape[-1]
         factor = 2 ** self.unet_params["num_downsample_layers"]
         padding = factor * math.ceil(subtomo_dim / factor) - subtomo_dim
-        # also make larger missing wedge mask that is compatible with the padded subtomos
-        mw_mask = get_missing_wedge_mask(grid_size=3*[subtomo_dim + padding], mw_angle=train_set.mw_angle)
+        use_ctf = train_set.use_ctf
+        if not use_ctf:
+            # also make larger missing wedge mask that is compatible with the padded subtomos
+            mw_mask = get_missing_wedge_mask(grid_size=3*[subtomo_dim + padding], mw_angle=train_set.mw_angle)
         with torch.no_grad():
             for batch in tqdm.tqdm(loader, desc="Updating subtomo missing wedges"):
                 assert batch["rot_angle"].float().norm() == 0
@@ -131,8 +133,17 @@ class LitUnet3D(pl.LightningModule):
                     mode="constant",
                     value=0,
                 )
-                # repeat missing wedge mask for each subtomo in the batch
-                mw_mask_batch = mw_mask.repeat((*subtomo_batch.shape[:-3], 1, 1, 1)).to(subtomo_batch.device)
+                if use_ctf:
+                    # each subtomo has its own CTF/mask; pad it the same way as the subtomos themselves
+                    mw_mask_batch = torch.nn.functional.pad(
+                        batch["mw_mask"].to(self.device),
+                        pad=(0, padding, 0, padding, 0, padding),
+                        mode="constant",
+                        value=0,
+                    )
+                else:
+                    # repeat missing wedge mask for each subtomo in the batch
+                    mw_mask_batch = mw_mask.repeat((*subtomo_batch.shape[:-3], 1, 1, 1)).to(subtomo_batch.device)
                 # forward pass
                 subtomo_batch_ref = self.forward(subtomo_batch)
                 # update missing wedges    

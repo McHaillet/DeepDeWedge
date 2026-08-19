@@ -36,8 +36,8 @@ class SubtomoDataset(Dataset):
     def __init__(
         self,
         subtomo_dir,
-        mw_angle,
         crop_subtomos_to_size,
+        mw_angle=None,
         rotate_subtomos=True,
         deterministic_rotations=False,
     ):
@@ -45,6 +45,17 @@ class SubtomoDataset(Dataset):
         self.subtomo_dir = subtomo_dir
         self.crop_subtomos_to_size = crop_subtomos_to_size
         self.mw_angle = mw_angle
+        # if subtomo_dir contains a 'ctf' subdirectory, i.e. a file '{index}.pt' with
+        # the same shape as 'subtomo0/{index}.pt' and 'subtomo1/{index}.pt' for every
+        # index, a per-subtomo 3D-CTF/mask (values in [0, 1], where 1 means a Fourier
+        # component is fully trusted and 0 means it is missing) is used instead of a
+        # binary wedge mask generated on the fly from mw_angle
+        self.use_ctf = os.path.isdir(f"{subtomo_dir}/ctf")
+        if not self.use_ctf and mw_angle is None:
+            raise ValueError(
+                f"mw_angle must be provided because '{subtomo_dir}' does not contain "
+                "a 'ctf' subdirectory."
+            )
         self.rotate_subtomos = rotate_subtomos
         self.deterministic_rotations = deterministic_rotations
 
@@ -76,6 +87,8 @@ class SubtomoDataset(Dataset):
         subtomo0 = safe_load(subtomo0_file)
         subtomo1_file = f"{self.subtomo_dir}/subtomo1/{index}.pt"
         subtomo1 = safe_load(subtomo1_file)
+        if self.use_ctf:
+            ctf = safe_load(f"{self.subtomo_dir}/ctf/{index}.pt")
         # rotate subtomos
         if self.rotate_subtomos == True:
             rot_axis, rot_angle = self._sample_rot_axis_and_angle(index)
@@ -91,25 +104,49 @@ class SubtomoDataset(Dataset):
                 rot_axis=rot_axis,
                 output_shape=3 * [self.crop_subtomos_to_size],
             )
-            # add missing wedge
-            mw_mask = get_missing_wedge_mask(
-                grid_size=3 * [self.crop_subtomos_to_size],
-                mw_angle=self.mw_angle,
-                device=subtomo0.device,
-            )
-            rot_mw_mask = get_rotated_missing_wedge_mask(
-                grid_size=3 * [self.crop_subtomos_to_size],
-                mw_angle=self.mw_angle,
-                rot_axis=rot_axis,
-                rot_angle=rot_angle,
-                device=subtomo0.device,
-            )
+            # add missing wedge/CTF
+            if self.use_ctf:
+                # mw_mask plays the role of a "canonical", un-rotated wedge/CTF that
+                # is imposed on the already-rotated subtomo0 as additional corruption
+                # for self-supervised training (see get_missing_wedge_mask below for
+                # the binary-wedge equivalent). Since we only have one real CTF per
+                # subtomo pair, we reuse it here too, only center-cropped (rot_angle=0).
+                mw_mask = rotate_vol_around_axis(
+                    ctf,
+                    rot_angle=0,
+                    rot_axis=rot_axis,
+                    output_shape=3 * [self.crop_subtomos_to_size],
+                )
+                # rot_mw_mask tracks the real, underlying CTF geometry as the
+                # sub-tomogram is rotated for augmentation
+                rot_mw_mask = rotate_vol_around_axis(
+                    ctf,
+                    rot_angle=rot_angle,
+                    rot_axis=rot_axis,
+                    output_shape=3 * [self.crop_subtomos_to_size],
+                )
+            else:
+                mw_mask = get_missing_wedge_mask(
+                    grid_size=3 * [self.crop_subtomos_to_size],
+                    mw_angle=self.mw_angle,
+                    device=subtomo0.device,
+                )
+                rot_mw_mask = get_rotated_missing_wedge_mask(
+                    grid_size=3 * [self.crop_subtomos_to_size],
+                    mw_angle=self.mw_angle,
+                    rot_axis=rot_axis,
+                    rot_angle=rot_angle,
+                    device=subtomo0.device,
+                )
         else:
-            mw_mask = get_missing_wedge_mask(
-                grid_size=subtomo0.shape,
-                mw_angle=self.mw_angle,
-                device=subtomo0.device,
-            )
+            if self.use_ctf:
+                mw_mask = ctf
+            else:
+                mw_mask = get_missing_wedge_mask(
+                    grid_size=subtomo0.shape,
+                    mw_angle=self.mw_angle,
+                    device=subtomo0.device,
+                )
             rot_mw_mask = mw_mask
             rot_angle, rot_axis = 0, torch.tensor([1.0, 0.0, 0.0])
 
