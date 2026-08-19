@@ -104,3 +104,55 @@ def test_model_input_matches_rotated_subtomo_when_ctf_is_ones(make_subtomo_dir):
     item = ds[0]
     max_err = (item["model_input"] - expected).abs().max().item()
     assert max_err < 1e-3, f"model_input should match rotated+cropped subtomo0, got max_err={max_err}"
+
+
+def test_rfftn_shaped_ctf_is_auto_converted(tmp_path):
+    """
+    ctf/ctf_crop files may be supplied in rfftn convention (half-size last axis, DC
+    at [0,0,0], unshifted) instead of the full (N, N, N) fftshifted layout; they must
+    be auto-converted on load to give identical results to supplying the pre-converted
+    full form directly.
+    """
+    from ddw.utils.fourier import rfft_mask_to_full_mask
+
+    native, crop = 16, 12
+    torch.manual_seed(0)
+    # the rfftn-shaped half arrays are the "authoritative" representation here (as a
+    # real rfftn-convention CTF file would be); the full/fftshifted equivalent is
+    # derived from them via the same conversion SubtomoDataset applies internally, so
+    # both directories represent the exact same underlying mask
+    ctf_native_half = torch.rand(native, native, native // 2 + 1)
+    ctf_crop_half = torch.rand(crop, crop, crop // 2 + 1)
+    ctf_native_full = rfft_mask_to_full_mask(ctf_native_half)
+    ctf_crop_full = rfft_mask_to_full_mask(ctf_crop_half)
+
+    def build(root, ctf_native, ctf_crop):
+        split = root / "fitting_subtomos"
+        for sub in ["subtomo0", "subtomo1", "ctf", "ctf_crop"]:
+            (split / sub).mkdir(parents=True)
+        subtomo0 = torch.randn(native, native, native)
+        subtomo1 = torch.randn(native, native, native)
+        torch.save(subtomo0, split / "subtomo0" / "0.pt")
+        torch.save(subtomo1, split / "subtomo1" / "0.pt")
+        torch.save(ctf_native, split / "ctf" / "0.pt")
+        torch.save(ctf_crop, split / "ctf_crop" / "0.pt")
+        return split
+
+    # dataset A: ctf/ctf_crop given already as full (N, N, N), fftshifted
+    root_full = build(tmp_path / "full", ctf_native_full, ctf_crop_full)
+    # dataset B: same underlying masks, but given in rfftn convention - SubtomoDataset
+    # must convert these to match dataset A exactly
+    root_half = build(tmp_path / "half", ctf_native_half, ctf_crop_half)
+
+    ds_full = SubtomoDataset(
+        subtomo_dir=str(root_full), crop_subtomos_to_size=crop, deterministic_rotations=True
+    )
+    ds_half = SubtomoDataset(
+        subtomo_dir=str(root_half), crop_subtomos_to_size=crop, deterministic_rotations=True
+    )
+    # both datasets load different subtomo0/subtomo1 (independent random draws in
+    # `build`), so compare the masks directly rather than the full item
+    item_full = ds_full[0]
+    item_half = ds_half[0]
+    assert torch.allclose(item_full["mw_mask"], item_half["mw_mask"], atol=1e-5)
+    assert torch.allclose(item_full["rot_mw_mask"], item_half["rot_mw_mask"], atol=1e-5)

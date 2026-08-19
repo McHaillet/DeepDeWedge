@@ -31,6 +31,33 @@ def apply_fourier_mask_to_tomo(tomo, mask, output="real"):
         return vol_filt
 
 
+def rfft_mask_to_full_mask(mask):
+    """
+    Converts a real-valued Fourier mask/CTF in rfftn convention - shape
+    (N, N, N//2+1), DC at index [0,0,0] - into the full (N, N, N) shape expected
+    everywhere else in this codebase, with DC shifted to the center voxel (matching
+    fft_3d's convention). If 'mask' is already shaped (N, N, N), it is returned
+    unchanged.
+
+    The expansion uses the symmetry X[i,j,k] = conj(X[(-i)%N, (-j)%N, N-k]) (a no-op
+    for real-valued masks/dtypes, but kept so this is also correct if 'mask' happens
+    to be stored with a complex dtype).
+    """
+    n0, n1, n2 = mask.shape[-3:]
+    if n0 != n1 or n2 != n0 // 2 + 1:
+        # not rfftn-shaped (assumed already full (N, N, N))
+        return mask
+    N = n0
+    full = torch.zeros(mask.shape[:-3] + (N, N, N), dtype=mask.dtype, device=mask.device)
+    full[..., :n2] = mask
+    for k in range(n2, N):
+        mirror_k = N - k
+        mirrored = torch.flip(mask[..., mirror_k], dims=[-2, -1])
+        mirrored = torch.roll(mirrored, shifts=(1, 1), dims=(-2, -1))
+        full[..., k] = torch.conj(mirrored)
+    return torch.fft.fftshift(full, dim=(-3, -2, -1))
+
+
 def get_3d_fft_freqs_on_grid(grid_size, device="cpu"):
     """
     Produces a 3D tensor with shape 'grid_size' whose entries are the spatial frequencies that correspond to the entries of a fourier transform computed with 'fft_3d'.

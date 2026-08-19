@@ -1,4 +1,6 @@
 import math
+import os
+import shutil
 
 import pytorch_lightning as pl
 import torch
@@ -10,6 +12,15 @@ from .fourier import apply_fourier_mask_to_tomo
 from .masked_loss import masked_loss
 from .missing_wedge import get_missing_wedge_mask
 from .normalization import get_avg_model_input_mean_and_std_from_dataloader
+from .subtomo_dataset import safe_load
+
+
+def _pure_subtomo0_file(subtomo0_file):
+    """
+    Maps '.../subtomo0/{index}.pt' to the corresponding '.../subtomo0_pure/{index}.pt'.
+    """
+    split_dir = os.path.dirname(os.path.dirname(subtomo0_file))
+    return os.path.join(split_dir, "subtomo0_pure", os.path.basename(subtomo0_file))
 
 
 class LitUnet3D(pl.LightningModule):
@@ -109,6 +120,19 @@ class LitUnet3D(pl.LightningModule):
             val_set = val_loader.dataset
             val_set.rotate_subtomos = False
             datasets.append(val_set)
+        # back up subtomo0 to subtomo0_pure the first time this runs (subtomo0 is
+        # still guaranteed pristine at that point, since this is the only place that
+        # ever overwrites it). Every update from then on is anchored to this
+        # permanent, read-only snapshot rather than to whatever is currently on disk,
+        # so that repeatedly blending real data with the model's own (smoother,
+        # denoised) predictions over many update cycles can't erode the real-data
+        # contribution towards zero. This is a no-op for the legacy binary wedge
+        # (mask is 0 or 1, so current == pure wherever it matters), but matters for a
+        # continuous CTF mask.
+        for ds in datasets:
+            pure_dir = f"{ds.subtomo_dir}/subtomo0_pure"
+            if not os.path.exists(pure_dir):
+                shutil.copytree(f"{ds.subtomo_dir}/subtomo0", pure_dir)
         dataset = torch.utils.data.ConcatDataset(datasets)
         loader = torch.utils.data.DataLoader(
             dataset,
@@ -138,10 +162,11 @@ class LitUnet3D(pl.LightningModule):
         with torch.no_grad():
             for batch in tqdm.tqdm(loader, desc="Updating subtomo missing wedges"):
                 assert batch["rot_angle"].float().norm() == 0
-                subtomo_batch = batch["model_input"].to(self.device)
+                pure_files = [_pure_subtomo0_file(f) for f in batch["subtomo0_file"]]
+                subtomo_pure_batch = torch.stack([safe_load(f) for f in pure_files]).to(self.device)
                 if padding > 0:
-                    subtomo_batch = torch.nn.functional.pad(
-                        subtomo_batch,
+                    subtomo_pure_batch = torch.nn.functional.pad(
+                        subtomo_pure_batch,
                         pad=(0, padding, 0, padding, 0, padding),
                         mode="constant",
                         value=0,
@@ -151,12 +176,18 @@ class LitUnet3D(pl.LightningModule):
                     mw_mask_batch = batch["mw_mask"].to(self.device)
                 else:
                     # repeat missing wedge mask for each subtomo in the batch
-                    mw_mask_batch = mw_mask.repeat((*subtomo_batch.shape[:-3], 1, 1, 1)).to(subtomo_batch.device)
-                # forward pass
-                subtomo_batch_ref = self.forward(subtomo_batch)
+                    mw_mask_batch = mw_mask.repeat((*subtomo_pure_batch.shape[:-3], 1, 1, 1)).to(subtomo_pure_batch.device)
+                # forward pass, fed the pure snapshot un-masked: subtomo_pure_batch is
+                # un-rotated (native orientation), same as mw_mask_batch, so masking it
+                # here would apply the *same* real corruption a second time, in the
+                # same orientation - it already happened during acquisition/
+                # reconstruction (harmless for the old binary wedge, since 0/1 is
+                # idempotent under repeated multiplication, but a genuine
+                # over-attenuation for a continuous CTF)
+                subtomo_batch_ref = self.forward(subtomo_pure_batch)
                 # update missing wedges
                 subtomo_batch = apply_fourier_mask_to_tomo(
-                    subtomo_batch, mw_mask_batch
+                    subtomo_pure_batch, mw_mask_batch
                 ) + apply_fourier_mask_to_tomo(subtomo_batch_ref, 1 - mw_mask_batch)
                 if padding > 0:
                     subtomo_batch = subtomo_batch[

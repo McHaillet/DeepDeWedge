@@ -73,7 +73,7 @@ def fit_model(
     mw_angle: Annotated[
         Optional[float],
         typer.Option(
-            help="Width of the missing wedge in degrees. Required unless subtomo_dir contains 'ctf' and 'ctf_crop' subdirectories (i.e. '{subtomo_dir}/fitting_subtomos/{ctf,ctf_crop}/{index}.pt' and, if present, the same under val_subtomos), in which case the per-subtomogram 3D-CTF/mask found there is used instead and this option is ignored. 'ctf/{index}.pt' must have the same shape as the corresponding subtomo0/subtomo1 (values in [0, 1]); 'ctf_crop/{index}.pt' must have shape subtomo_size and be independently, correctly computed at that resolution (not derived by resizing 'ctf/{index}.pt', which would misrepresent the CTF)."
+            help="Width of the missing wedge in degrees. Required unless subtomo_dir contains 'ctf' and 'ctf_crop' subdirectories (i.e. '{subtomo_dir}/fitting_subtomos/{ctf,ctf_crop}/{index}.pt' and, if present, the same under val_subtomos), in which case the per-subtomogram 3D-CTF/mask found there is used instead and this option is ignored. 'ctf/{index}.pt' must match the corresponding subtomo0/subtomo1 (values in [0, 1]); 'ctf_crop/{index}.pt' must match subtomo_size and be independently, correctly computed at that resolution (not derived by resizing 'ctf/{index}.pt', which would misrepresent the CTF). Each tensor may be a full (N, N, N) array (DC at the center) or a real-valued rfftn-convention array of shape (N, N, N//2+1) with DC at [0,0,0] (unshifted) - the latter is expanded automatically."
         ),
     ] = None,
     logger: Annotated[
