@@ -73,7 +73,7 @@ def fit_model(
     mw_angle: Annotated[
         Optional[float],
         typer.Option(
-            help="Width of the missing wedge in degrees. Required unless subtomo_dir contains a 'ctf' subdirectory (i.e. '{subtomo_dir}/fitting_subtomos/ctf/{index}.pt' and, if present, '{subtomo_dir}/val_subtomos/ctf/{index}.pt', each a tensor of the same shape as the corresponding subtomo0/subtomo1 with values in [0, 1]), in which case the per-subtomogram 3D-CTF/mask found there is used instead and this option is ignored."
+            help="Width of the missing wedge in degrees. Required unless subtomo_dir contains 'ctf' and 'ctf_crop' subdirectories (i.e. '{subtomo_dir}/fitting_subtomos/{ctf,ctf_crop}/{index}.pt' and, if present, the same under val_subtomos), in which case the per-subtomogram 3D-CTF/mask found there is used instead and this option is ignored. 'ctf/{index}.pt' must have the same shape as the corresponding subtomo0/subtomo1 (values in [0, 1]); 'ctf_crop/{index}.pt' must have shape subtomo_size and be independently, correctly computed at that resolution (not derived by resizing 'ctf/{index}.pt', which would misrepresent the CTF)."
         ),
     ] = None,
     logger: Annotated[

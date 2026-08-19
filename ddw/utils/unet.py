@@ -1,3 +1,5 @@
+import math
+
 import pytorch_lightning as pl
 import torch
 import tqdm
@@ -116,19 +118,34 @@ class LitUnet3D(pl.LightningModule):
         # subtomo size has to be divisible by 2**num_downsample_layers due to U-Net architecture
         subtomo_dim = dataset[0]["model_input"].shape[-1]
         factor = 2 ** self.unet_params["num_downsample_layers"]
-        if subtomo_dim % factor != 0:
-            raise ValueError(
-                f"The on-disk sub-tomogram size ({subtomo_dim}) must be divisible by "
-                f"2**num_downsample_layers ({factor}) to update the subtomo missing "
-                "wedges/CTFs. Extract your sub-tomograms at a compatible size."
-            )
         use_ctf = train_set.use_ctf
-        if not use_ctf:
-            mw_mask = get_missing_wedge_mask(grid_size=3*[subtomo_dim], mw_angle=train_set.mw_angle)
+        if use_ctf:
+            # a per-subtomo CTF has no closed form to regenerate at a different grid
+            # size (unlike the analytic binary wedge below), so we require the
+            # on-disk size to already be compatible instead of padding
+            if subtomo_dim % factor != 0:
+                raise ValueError(
+                    f"The on-disk sub-tomogram size ({subtomo_dim}) must be divisible "
+                    f"by 2**num_downsample_layers ({factor}) to update the subtomo "
+                    "CTFs. Extract your sub-tomograms at a compatible size."
+                )
+            padding = 0
+        else:
+            # ensure divisibility by padding; also make a larger missing wedge mask
+            # that is compatible with the padded subtomos
+            padding = factor * math.ceil(subtomo_dim / factor) - subtomo_dim
+            mw_mask = get_missing_wedge_mask(grid_size=3*[subtomo_dim + padding], mw_angle=train_set.mw_angle)
         with torch.no_grad():
             for batch in tqdm.tqdm(loader, desc="Updating subtomo missing wedges"):
                 assert batch["rot_angle"].float().norm() == 0
                 subtomo_batch = batch["model_input"].to(self.device)
+                if padding > 0:
+                    subtomo_batch = torch.nn.functional.pad(
+                        subtomo_batch,
+                        pad=(0, padding, 0, padding, 0, padding),
+                        mode="constant",
+                        value=0,
+                    )
                 if use_ctf:
                     # each subtomo has its own CTF/mask
                     mw_mask_batch = batch["mw_mask"].to(self.device)
@@ -141,6 +158,10 @@ class LitUnet3D(pl.LightningModule):
                 subtomo_batch = apply_fourier_mask_to_tomo(
                     subtomo_batch, mw_mask_batch
                 ) + apply_fourier_mask_to_tomo(subtomo_batch_ref, 1 - mw_mask_batch)
+                if padding > 0:
+                    subtomo_batch = subtomo_batch[
+                        ..., :subtomo_dim, :subtomo_dim, :subtomo_dim
+                    ]
                 for subtomo, file in zip(subtomo_batch, batch["subtomo0_file"]):
                     torch.save(subtomo.cpu().clone(), file)
         train_set.rotate_subtomos = True
