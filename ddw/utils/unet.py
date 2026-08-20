@@ -415,18 +415,20 @@ class SpatialDownSampling(nn.Module):
 class SpatialUpSampling(nn.Module):
     def __init__(self, in_chans: int, out_chans: int, drop_prob=0.0):
         super().__init__()
-        self.tconv = nn.ConvTranspose3d(
-            in_chans,
-            out_chans,
-            kernel_size=(3, 3, 3),
-            stride=(2, 2, 2),
-            padding=1,
-            output_padding=1,
+        # Nearest-neighbor upsampling followed by a stride-1 conv, instead of a
+        # strided ConvTranspose3d: with kernel_size=3 not divisible by stride=2, the
+        # transposed conv gives uneven kernel overlap across output voxels, a
+        # deterministic period-2 "checkerboard" artifact (see Odena et al., "Deconvolution
+        # and Checkerboard Artifacts"). Resize+conv has no stride mismatch to produce
+        # that unevenness.
+        self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
+        self.conv = nn.Conv3d(
+            in_chans, out_chans, kernel_size=(3, 3, 3), stride=(1, 1, 1), padding=1
         )
         self.activation = nn.LeakyReLU(negative_slope=0.05, inplace=True)
 
     def forward(self, volume: torch.Tensor, cat: torch.Tensor) -> torch.Tensor:
-        output = self.tconv(volume)
+        output = self.conv(self.upsample(volume))
         output = torch.cat([output, cat], dim=1)
         output = self.activation(output)
         return output
