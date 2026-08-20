@@ -8,7 +8,7 @@ from torch.utils.data import Dataset
 from .fourier import apply_fourier_mask_to_tomo, rfft_mask_to_full_mask
 from .missing_wedge import (get_missing_wedge_mask,
                             get_rotated_missing_wedge_mask)
-from .rotation import rotate_vol_around_axis
+from .rotation import rotate_fourier_mask_around_axis, rotate_vol_around_axis
 
 BASE_SEED = 888
 
@@ -141,7 +141,7 @@ class SubtomoDataset(Dataset):
                 # happens: it's already at crop_subtomos_to_size).
                 ctf_crop = rfft_mask_to_full_mask(safe_load(f"{self.subtomo_dir}/ctf_crop/{index}.pt"))
                 mw_mask = ctf_crop
-                rot_mw_mask = rotate_vol_around_axis(
+                rot_mw_mask = rotate_fourier_mask_around_axis(
                     ctf_crop,
                     rot_angle=rot_angle,
                     rot_axis=rot_axis,

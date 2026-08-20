@@ -3,7 +3,7 @@ import math
 import torch
 
 from .fourier import get_3d_fft_freqs_on_grid
-from .rotation import rotate_vol_around_axis
+from .rotation import rotate_fourier_mask_around_axis
 
 
 def get_missing_wedge_mask(grid_size, mw_angle, device="cpu"):
@@ -42,12 +42,11 @@ def get_rotated_missing_wedge_mask(
     adjusted_grid_size = (torch.ceil(math.sqrt(2) * grid_size) / 2.0) * 2
     mw_mask = get_missing_wedge_mask(grid_size=adjusted_grid_size, mw_angle=mw_angle)
     mw_mask = (
-        rotate_vol_around_axis(
-            vol=mw_mask,
+        rotate_fourier_mask_around_axis(
+            mask=mw_mask,
             rot_angle=rot_angle,
             rot_axis=rot_axis,
             output_shape=grid_size,
-            order=3,
         )
         .float()
         .to(device)
