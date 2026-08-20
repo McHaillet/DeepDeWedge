@@ -186,10 +186,13 @@ class LitUnet3D(pl.LightningModule):
                 # idempotent under repeated multiplication, but a genuine
                 # over-attenuation for a continuous CTF)
                 subtomo_batch_ref = self.forward(subtomo_pure_batch)
-                # update missing wedges
-                subtomo_batch = apply_fourier_mask_to_tomo(
-                    subtomo_pure_batch, mw_mask_batch
-                ) + apply_fourier_mask_to_tomo(subtomo_batch_ref, 1 - mw_mask_batch)
+                # update missing wedges: keep the real observation as-is (it already
+                # carries its own real degradation - masking it again would compound
+                # to mask**2, same double-application issue as above) and fill in only
+                # the untrusted frequencies with the model's prediction
+                subtomo_batch = subtomo_pure_batch + apply_fourier_mask_to_tomo(
+                    subtomo_batch_ref, 1 - mw_mask_batch
+                )
                 if padding > 0:
                     subtomo_batch = subtomo_batch[
                         ..., :subtomo_dim, :subtomo_dim, :subtomo_dim
