@@ -265,6 +265,7 @@ def fit_model(
         num_workers=num_workers,
         persistent_workers=True,
         pin_memory=True,
+        shuffle=True,
     )
     if val_data_exists:
         val_dataloader = DataLoader(
