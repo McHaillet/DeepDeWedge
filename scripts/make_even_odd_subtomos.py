@@ -152,21 +152,21 @@ def main() -> None:
         images_even = images_even.to(device)
 
         even_vols = batched_reconstruct(
-            lambda p: ts.reconstruct_subvolumes_single(images_even, p, pixel_size=args.pixel_size, size=args.box_size),
+            lambda p: ts.reconstruct_subvolumes_single(images_even, p, pixel_size=args.pixel_size, size=args.box_size, apply_ctf=True, correct_attenuation=True),
             positions_dev, args.batch_size,
         )
         odd_vols = batched_reconstruct(
-            lambda p: ts.reconstruct_subvolumes_single(images_odd, p, pixel_size=args.pixel_size, size=args.box_size),
+            lambda p: ts.reconstruct_subvolumes_single(images_odd, p, pixel_size=args.pixel_size, size=args.box_size, apply_ctf=True, correct_attenuation=True),
             positions_dev, args.batch_size,
         )
         # Shared 3D-CTF: identical for even and odd, so reconstructed once per position.
         # Two independent reconstructions, one per box size (ctf_crop is not a resize of ctf).
         ctf_vols = batched_reconstruct(
-            lambda p: ts.reconstruct_subvolume_ctfs_single(p, pixel_size=args.pixel_size, size=args.box_size),
+            lambda p: ts.reconstruct_subvolume_ctfs_single(p, pixel_size=args.pixel_size, size=args.box_size, apply_ctf=True),
             positions_dev, args.batch_size,
         )
         ctf_crop_vols = batched_reconstruct(
-            lambda p: ts.reconstruct_subvolume_ctfs_single(p, pixel_size=args.pixel_size, size=args.crop_box_size),
+            lambda p: ts.reconstruct_subvolume_ctfs_single(p, pixel_size=args.pixel_size, size=args.crop_box_size, apply_ctf=True),
             positions_dev, args.batch_size,
         )
 
