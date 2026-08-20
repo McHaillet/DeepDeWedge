@@ -140,7 +140,8 @@ class LitUnet3D(pl.LightningModule):
             num_workers=train_loader.num_workers,
         )
         # subtomo size has to be divisible by 2**num_downsample_layers due to U-Net architecture
-        subtomo_dim = dataset[0]["model_input"].shape[-1]
+        # (model_input isn't present here since rotate_subtomos is False; model_target has the same native shape)
+        subtomo_dim = dataset[0]["model_target"].shape[-1]
         factor = 2 ** self.unet_params["num_downsample_layers"]
         use_ctf = train_set.use_ctf
         if use_ctf:

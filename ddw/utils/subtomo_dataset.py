@@ -178,10 +178,8 @@ class SubtomoDataset(Dataset):
                 )
             rot_mw_mask = mw_mask
             rot_angle, rot_axis = 0, torch.tensor([1.0, 0.0, 0.0])
-            model_input = apply_fourier_mask_to_tomo(subtomo0, mw_mask)
 
         item = {
-            "model_input": model_input,
             "model_target": subtomo1,
             "mw_mask": mw_mask,
             "rot_mw_mask": rot_mw_mask,
@@ -190,6 +188,13 @@ class SubtomoDataset(Dataset):
             "rot_angle": rot_angle,
             "rot_axis": rot_axis,
         }
+        if self.rotate_subtomos == True:
+            # model_input is not computed when rotate_subtomos is False: no consumer
+            # needs it there (update_subtomo_missing_wedges re-masks subtomo0_pure
+            # itself), so the key is omitted entirely rather than set to a placeholder
+            # - any accidental access fails loudly with a KeyError instead of
+            # silently getting a stale/masked-but-unrotated volume.
+            item["model_input"] = model_input
         return item
 
 

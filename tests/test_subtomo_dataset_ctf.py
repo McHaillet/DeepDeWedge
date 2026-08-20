@@ -70,7 +70,10 @@ def test_ctf_no_rotate_uses_raw_native_ctf(make_subtomo_dir):
         subtomo_dir=str(root / "fitting_subtomos"), crop_subtomos_to_size=crop, rotate_subtomos=False
     )
     item = ds[0]
-    assert item["model_input"].shape == (native, native, native)
+    # model_input is not computed in this path (no consumer needs it; see
+    # update_subtomo_missing_wedges, which re-masks subtomo0_pure itself), so the
+    # key is omitted entirely rather than set to a placeholder
+    assert "model_input" not in item
     assert item["mw_mask"].shape == (native, native, native)
     raw_ctf = torch.load(root / "fitting_subtomos" / "ctf" / "0.pt")
     assert torch.equal(item["mw_mask"], raw_ctf)
