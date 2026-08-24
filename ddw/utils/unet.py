@@ -1,26 +1,15 @@
-import math
-import os
-import shutil
+import random
 
 import pytorch_lightning as pl
 import torch
-import tqdm
 import yaml
 from torch import nn
 
 from .fourier import apply_fourier_mask_to_tomo
-from .masked_loss import masked_loss
-from .missing_wedge import get_missing_wedge_mask
+from .losses import data_consistency_loss, equivariance_loss
 from .normalization import get_avg_model_input_mean_and_std_from_dataloader
-from .subtomo_dataset import safe_load
-
-
-def _pure_subtomo0_file(subtomo0_file):
-    """
-    Maps '.../subtomo0/{index}.pt' to the corresponding '.../subtomo0_pure/{index}.pt'.
-    """
-    split_dir = os.path.dirname(os.path.dirname(subtomo0_file))
-    return os.path.join(split_dir, "subtomo0_pure", os.path.basename(subtomo0_file))
+from .rotation import rotate_vol_around_axis
+from .subtomo_dataset import sample_rot_axis_and_angle
 
 
 class LitUnet3D(pl.LightningModule):
@@ -32,16 +21,14 @@ class LitUnet3D(pl.LightningModule):
         self,
         unet_params,
         adam_params,
-        subtomo_dir,
-        update_subtomo_missing_wedges_every_n_epochs=10,
+        subtomo_size,
+        eq_loss_weight=1.0,
     ):
         super().__init__()
         self.unet_params = unet_params
         self.adam_params = adam_params
-        self.subtomo_dir = subtomo_dir
-        self.update_subtomo_missing_wedges_every_n_epochs = (
-            update_subtomo_missing_wedges_every_n_epochs
-        )
+        self.subtomo_size = subtomo_size
+        self.eq_loss_weight = eq_loss_weight
         self.unet = Unet3D(**self.unet_params)
         # self.ema = ExponentialMovingAverage(self.unet.parameters(), decay=0.995)
         self.save_hyperparameters()
@@ -51,48 +38,94 @@ class LitUnet3D(pl.LightningModule):
             1
         )  # unsqueeze to add channel dimension, squeeze to remove it
 
+    def _center_crop(self, vol):
+        """
+        Center-crops the last 3 dims of 'vol' (native/on-disk size) down to
+        'self.subtomo_size'.
+        """
+        size = self.subtomo_size
+        offsets = [(s - size) // 2 for s in vol.shape[-3:]]
+        return vol[
+            ...,
+            offsets[0] : offsets[0] + size,
+            offsets[1] : offsets[1] + size,
+            offsets[2] : offsets[2] + size,
+        ]
+
+    def _rotate_batch(self, vol_batch, indices, deterministic):
+        """
+        Rotates each volume in 'vol_batch' by an independently sampled rotation, cropping
+        down to 'self.subtomo_size'. Uses rotate_vol_around_axis, which is not
+        differentiable and requires CPU tensors - 'vol_batch' must already be detached.
+        """
+        rotated = []
+        for vol, index in zip(vol_batch, indices):
+            rot_axis, rot_angle = sample_rot_axis_and_angle(int(index), deterministic)
+            rotated.append(
+                rotate_vol_around_axis(
+                    vol.cpu(),
+                    rot_angle=rot_angle,
+                    rot_axis=rot_axis,
+                    output_shape=3 * [self.subtomo_size],
+                )
+            )
+        return torch.stack(rotated).to(vol_batch.device)
+
+    def _step(self, batch, batch_idx, deterministic):
+        subtomo0_native = batch["subtomo0"]
+        subtomo1_native = batch["subtomo1"]
+        ctf = batch["ctf"]  # native orientation, already at self.subtomo_size
+
+        x_hat0_native = self(subtomo0_native)
+        x_hat1_native = self(subtomo1_native)
+
+        x_hat0 = self._center_crop(x_hat0_native)
+        x_hat1 = self._center_crop(x_hat1_native)
+        y0 = self._center_crop(subtomo0_native)
+        y1 = self._center_crop(subtomo1_native)
+        dc_loss = data_consistency_loss(x_hat0, x_hat1, y0, y1, ctf)
+
+        # alternate which of the two estimates feeds the equivariance term each step,
+        # bounding compute to 3 (rather than 4) forward passes of the model
+        use_branch0 = (
+            (batch_idx % 2 == 0) if deterministic else (random.random() < 0.5)
+        )
+        x_hat_native = x_hat0_native if use_branch0 else x_hat1_native
+        # rotation is not differentiable (see rotate_vol_around_axis / _rotate_batch), so
+        # x_hat_native must be detached here regardless; the gradient of eq_loss therefore
+        # only flows through the second application of self() below
+        x_hat_rot = self._rotate_batch(
+            x_hat_native.detach(), batch["index"], deterministic
+        )
+        z = apply_fourier_mask_to_tomo(x_hat_rot, ctf)
+        x_double_hat = self(z)
+        eq_loss = equivariance_loss(x_double_hat, x_hat_rot)
+
+        loss = dc_loss + self.eq_loss_weight * eq_loss
+        return loss, dc_loss, eq_loss
+
     def training_step(self, batch, batch_idx):
-        model_output = self(batch["model_input"])
-        loss = masked_loss(
-            model_output=model_output,
-            target=batch["model_target"],
-            rot_mw_mask=batch["rot_mw_mask"],
-            mw_mask=batch["mw_mask"],
-        )
-        self.log(
-            "fitting_loss",
-            loss,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-        )
+        loss, dc_loss, eq_loss = self._step(batch, batch_idx, deterministic=False)
+        # sync_dist=True: under multi-GPU DDP each rank only sees its own shard, so without
+        # this the ModelCheckpoint callbacks that monitor "fitting_loss"/"val_loss" (see
+        # fit_model.py) would select checkpoints based on a single rank's partial view of
+        # the loss instead of the true value averaged across all ranks
+        self.log("fitting_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log("fitting_dc_loss", dc_loss, on_step=False, on_epoch=True, logger=True, sync_dist=True)
+        self.log("fitting_eq_loss", eq_loss, on_step=False, on_epoch=True, logger=True, sync_dist=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        model_output = self(batch["model_input"])
-        loss = masked_loss(
-            model_output=model_output,
-            target=batch["model_target"],
-            rot_mw_mask=batch["rot_mw_mask"],
-            mw_mask=batch["mw_mask"],
-        )
-        self.log(
-            "val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True
-        )
+        loss, dc_loss, eq_loss = self._step(batch, batch_idx, deterministic=True)
+        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log("val_dc_loss", dc_loss, on_step=False, on_epoch=True, logger=True, sync_dist=True)
+        self.log("val_eq_loss", eq_loss, on_step=False, on_epoch=True, logger=True, sync_dist=True)
 
     # def on_before_zero_grad(self, optimizer) -> None:
     #     self.ema.update()
 
     def on_train_start(self) -> None:
         if self.current_epoch == 0:
-            self.update_normalization()
-
-    def on_train_epoch_end(self) -> None:
-        if (
-            self.current_epoch + 1
-        ) % self.update_subtomo_missing_wedges_every_n_epochs == 0:  # +1 because the epoch indexing starts at 0
-            self.update_subtomo_missing_wedges()
             self.update_normalization()
 
     def configure_optimizers(self):
@@ -103,105 +136,6 @@ class LitUnet3D(pl.LightningModule):
     # def lr_scheduler_step(self, scheduler, optimizer_idx, metric) -> None:
     #     if scheduler is not None:
     #         scheduler.step()
-
-    def update_subtomo_missing_wedges(self):
-        """
-        Update the missing wedges of model input subtomos.
-        """
-        # we don't want to rotate the subtomos when updating them, so we create new dataloader objects with rotate_subtomos=False
-        datasets = []
-        train_loader = self.trainer.train_dataloader.loaders
-        train_set = train_loader.dataset
-        train_set.rotate_subtomos = False
-        datasets.append(train_set)
-        # val_dataloaders may be None
-        if self.trainer.val_dataloaders is not None:
-            val_loader = self.trainer.val_dataloaders[0]
-            val_set = val_loader.dataset
-            val_set.rotate_subtomos = False
-            datasets.append(val_set)
-        # back up subtomo0 to subtomo0_pure the first time this runs (subtomo0 is
-        # still guaranteed pristine at that point, since this is the only place that
-        # ever overwrites it). Every update from then on is anchored to this
-        # permanent, read-only snapshot rather than to whatever is currently on disk,
-        # so that repeatedly blending real data with the model's own (smoother,
-        # denoised) predictions over many update cycles can't erode the real-data
-        # contribution towards zero. This is a no-op for the legacy binary wedge
-        # (mask is 0 or 1, so current == pure wherever it matters), but matters for a
-        # continuous CTF mask.
-        for ds in datasets:
-            pure_dir = f"{ds.subtomo_dir}/subtomo0_pure"
-            if not os.path.exists(pure_dir):
-                shutil.copytree(f"{ds.subtomo_dir}/subtomo0", pure_dir)
-        dataset = torch.utils.data.ConcatDataset(datasets)
-        loader = torch.utils.data.DataLoader(
-            dataset,
-            batch_size=train_loader.batch_size,
-            num_workers=train_loader.num_workers,
-        )
-        # subtomo size has to be divisible by 2**num_downsample_layers due to U-Net architecture
-        # (model_input isn't present here since rotate_subtomos is False; model_target has the same native shape)
-        subtomo_dim = dataset[0]["model_target"].shape[-1]
-        factor = 2 ** self.unet_params["num_downsample_layers"]
-        use_ctf = train_set.use_ctf
-        if use_ctf:
-            # a per-subtomo CTF has no closed form to regenerate at a different grid
-            # size (unlike the analytic binary wedge below), so we require the
-            # on-disk size to already be compatible instead of padding
-            if subtomo_dim % factor != 0:
-                raise ValueError(
-                    f"The on-disk sub-tomogram size ({subtomo_dim}) must be divisible "
-                    f"by 2**num_downsample_layers ({factor}) to update the subtomo "
-                    "CTFs. Extract your sub-tomograms at a compatible size."
-                )
-            padding = 0
-        else:
-            # ensure divisibility by padding; also make a larger missing wedge mask
-            # that is compatible with the padded subtomos
-            padding = factor * math.ceil(subtomo_dim / factor) - subtomo_dim
-            mw_mask = get_missing_wedge_mask(grid_size=3*[subtomo_dim + padding], mw_angle=train_set.mw_angle)
-        with torch.no_grad():
-            for batch in tqdm.tqdm(loader, desc="Updating subtomo missing wedges"):
-                assert batch["rot_angle"].float().norm() == 0
-                pure_files = [_pure_subtomo0_file(f) for f in batch["subtomo0_file"]]
-                subtomo_pure_batch = torch.stack([safe_load(f) for f in pure_files]).to(self.device)
-                if padding > 0:
-                    subtomo_pure_batch = torch.nn.functional.pad(
-                        subtomo_pure_batch,
-                        pad=(0, padding, 0, padding, 0, padding),
-                        mode="constant",
-                        value=0,
-                    )
-                if use_ctf:
-                    # each subtomo has its own CTF/mask
-                    mw_mask_batch = batch["mw_mask"].to(self.device)
-                else:
-                    # repeat missing wedge mask for each subtomo in the batch
-                    mw_mask_batch = mw_mask.repeat((*subtomo_pure_batch.shape[:-3], 1, 1, 1)).to(subtomo_pure_batch.device)
-                # forward pass, fed the pure snapshot un-masked: subtomo_pure_batch is
-                # un-rotated (native orientation), same as mw_mask_batch, so masking it
-                # here would apply the *same* real corruption a second time, in the
-                # same orientation - it already happened during acquisition/
-                # reconstruction (harmless for the old binary wedge, since 0/1 is
-                # idempotent under repeated multiplication, but a genuine
-                # over-attenuation for a continuous CTF)
-                subtomo_batch_ref = self.forward(subtomo_pure_batch)
-                # update missing wedges: keep the real observation as-is (it already
-                # carries its own real degradation - masking it again would compound
-                # to mask**2, same double-application issue as above) and fill in only
-                # the untrusted frequencies with the model's prediction
-                subtomo_batch = subtomo_pure_batch + apply_fourier_mask_to_tomo(
-                    subtomo_batch_ref, 1 - mw_mask_batch
-                )
-                if padding > 0:
-                    subtomo_batch = subtomo_batch[
-                        ..., :subtomo_dim, :subtomo_dim, :subtomo_dim
-                    ]
-                for subtomo, file in zip(subtomo_batch, batch["subtomo0_file"]):
-                    torch.save(subtomo.cpu().clone(), file)
-        train_set.rotate_subtomos = True
-        if self.trainer.val_dataloaders is not None:
-            val_set.rotate_subtomos = True
 
     def update_normalization(self):
         """

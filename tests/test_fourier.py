@@ -1,60 +1,47 @@
 """
-Tests for ddw.utils.fourier.rfft_mask_to_full_mask, the automatic conversion from
-rfftn-convention (half-size last axis, DC at [0,0,0]) masks/CTFs to the full,
-fftshifted (N, N, N) layout the rest of this codebase expects.
+Tests for ddw.utils.fourier: apply_fourier_mask_to_tomo (rfftn-based CTF/mask application)
+and fft_3d (the fftshifted full transform, used only for visualization).
 """
 import torch
 
-from ddw.utils.fourier import fft_3d, ifft_3d, rfft_mask_to_full_mask
+from ddw.utils.fourier import apply_fourier_mask_to_tomo, fft_3d
 
 
-def test_already_full_shaped_mask_passes_through_unchanged():
-    mask = torch.rand(8, 8, 8)
-    assert torch.equal(rfft_mask_to_full_mask(mask), mask)
-
-
-def test_matches_full_fftn_for_a_complex_spectrum():
-    """
-    rfftn(x) is exactly the first N//2+1 entries of the last axis of fftn(x). Expanding
-    it back out (undoing the fftshift this function applies, to compare against the
-    raw/unshifted fftn output) must reproduce fftn(x) exactly.
-    """
+def test_apply_fourier_mask_matches_direct_rfftn_masking():
     torch.manual_seed(0)
     for N in [8, 12, 32]:
-        x = torch.randn(N, N, N)
-        full_fftn = torch.fft.fftn(x)
-        half = torch.fft.rfftn(x)
-        reconstructed = torch.fft.ifftshift(rfft_mask_to_full_mask(half))
-        assert torch.allclose(full_fftn, reconstructed, atol=1e-4), N
-
-
-def test_masking_matches_direct_rfft_domain_masking():
-    """
-    The actual use case: a real-valued mask defined on the rfftn grid. Masking a
-    volume with it (via irfftn(rfftn(vol) * mask_half, ...)) must give the same
-    result as masking with the expanded+shifted mask via ddw's own fft_3d/ifft_3d.
-    """
-    torch.manual_seed(0)
-    for N in [8, 12, 32]:
-        mask_half = torch.rand(N, N, N // 2 + 1)
-        mask_full = rfft_mask_to_full_mask(mask_half)
+        mask = torch.rand(N, N, N // 2 + 1)
         vol = torch.randn(N, N, N)
-
-        direct = torch.fft.irfftn(torch.fft.rfftn(vol) * mask_half, s=(N, N, N))
-        via_ddw = ifft_3d(fft_3d(vol) * mask_full).real
-
-        assert torch.allclose(direct, via_ddw, atol=1e-4), N
+        expected = torch.fft.irfftn(torch.fft.rfftn(vol, norm="ortho") * mask, s=(N, N, N), norm="ortho")
+        result = apply_fourier_mask_to_tomo(vol, mask)
+        assert torch.allclose(expected, result, atol=1e-5), N
 
 
-def test_output_shape_and_dc_at_center():
+def test_apply_fourier_mask_all_ones_is_identity():
+    torch.manual_seed(0)
     N = 16
-    mask_half = torch.ones(N, N, N // 2 + 1)  # trivial: everywhere trusted
-    mask_full = rfft_mask_to_full_mask(mask_half)
-    assert mask_full.shape == (N, N, N)
-    # an all-ones rfftn-shaped mask expands to an all-ones full mask regardless of
-    # where DC ends up, so check DC placement with a non-trivial mask instead
-    mask_half = torch.zeros(N, N, N // 2 + 1)
-    mask_half[0, 0, 0] = 1.0  # DC, unshifted convention
-    mask_full = rfft_mask_to_full_mask(mask_half)
-    assert mask_full[N // 2, N // 2, N // 2] == 1.0
-    assert mask_full.sum() == 1.0
+    vol = torch.randn(N, N, N)
+    mask = torch.ones(N, N, N // 2 + 1)
+    result = apply_fourier_mask_to_tomo(vol, mask)
+    assert torch.allclose(vol, result, atol=1e-4)
+
+
+def test_apply_fourier_mask_all_zeros_gives_zero():
+    torch.manual_seed(0)
+    N = 16
+    vol = torch.randn(N, N, N)
+    mask = torch.zeros(N, N, N // 2 + 1)
+    result = apply_fourier_mask_to_tomo(vol, mask)
+    assert torch.allclose(result, torch.zeros_like(result), atol=1e-6)
+
+
+def test_fft_3d_puts_dc_at_center_for_constant_input():
+    N = 8
+    vol = torch.ones(N, N, N)
+    vol_ft = fft_3d(vol)
+    dc = N // 2
+    # a constant signal has all its energy at DC
+    mask = torch.ones_like(vol_ft, dtype=torch.bool)
+    mask[dc, dc, dc] = False
+    assert vol_ft[dc, dc, dc].abs() > 0
+    assert torch.allclose(vol_ft[mask], torch.zeros_like(vol_ft[mask]), atol=1e-6)

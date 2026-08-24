@@ -6,24 +6,23 @@ For each tilt series, a grid of box centers is built that evenly covers the
 tilt series' volume dimensions at `--box-size` (the native/on-disk box),
 with boxes overlapping their neighbors by at least `--overlap` (default 0.1)
 along each axis. At every grid position, an even and an odd subtomogram are
-reconstructed at `--box-size` from the movies' even/odd frame averages, plus
-two 3D-CTFs (identical for even and odd, since CTF does not depend on which
-half of the frames was used): one at `--box-size` matching the subtomograms
-exactly, and one independently reconstructed at the smaller `--crop-box-size`
-(the fit-model `subtomo_size`, e.g. after crop_subtomos_to_size) — this is
-not a resize/crop of the native CTF, it's its own reconstruction.
+reconstructed at `--box-size` from the movies' even/odd frame averages
+(`--box-size` must be larger than `--crop-box-size`, leaving room for
+fit-model to rotate its own estimate without zero-padding artifacts - see
+SubtomoDataset), plus a 3D-CTF (identical for even and odd, since CTF does
+not depend on which half of the frames was used), reconstructed directly at
+the smaller `--crop-box-size` (the fit-model `subtomo_size`) - not a
+resize/crop of a native-box-size CTF, which would misrepresent it.
 
 All subvolumes from all tilt series are pooled and randomly split into a
 fitting and a validation set (`--val-fraction`, default 0.2). Output layout:
 
     <directory>/subtomos/fitting_subtomos/subtomo0/{0,1,...}.pt    (even, box-size)
     <directory>/subtomos/fitting_subtomos/subtomo1/{0,1,...}.pt    (odd, box-size)
-    <directory>/subtomos/fitting_subtomos/ctf/{0,1,...}.pt         (box-size)
-    <directory>/subtomos/fitting_subtomos/ctf_crop/{0,1,...}.pt    (crop-box-size)
+    <directory>/subtomos/fitting_subtomos/ctf/{0,1,...}.pt         (crop-box-size)
     <directory>/subtomos/val_subtomos/subtomo0/{0,1,...}.pt        (even, box-size)
     <directory>/subtomos/val_subtomos/subtomo1/{0,1,...}.pt        (odd, box-size)
-    <directory>/subtomos/val_subtomos/ctf/{0,1,...}.pt             (box-size)
-    <directory>/subtomos/val_subtomos/ctf_crop/{0,1,...}.pt        (crop-box-size)
+    <directory>/subtomos/val_subtomos/ctf/{0,1,...}.pt             (crop-box-size)
 
 Reconstruction (subpixel cropping, backprojection) runs on `--device` (default
 "cpu"); pass e.g. "cuda" or "cuda:0" to reconstruct on GPU. Saved .pt files are
@@ -129,7 +128,7 @@ def main() -> None:
     output_dirs = {}
     for split in ("fitting", "val"):
         split_dir = subtomos_dir / f"{split}_subtomos"
-        output_dirs[split] = {name: split_dir / name for name in ("subtomo0", "subtomo1", "ctf", "ctf_crop")}
+        output_dirs[split] = {name: split_dir / name for name in ("subtomo0", "subtomo1", "ctf")}
         for sub_dir in output_dirs[split].values():
             sub_dir.mkdir(parents=True, exist_ok=True)
 
@@ -159,13 +158,9 @@ def main() -> None:
             lambda p: ts.reconstruct_subvolumes_single(images_odd, p, pixel_size=args.pixel_size, size=args.box_size, apply_ctf=True, correct_attenuation=True),
             positions_dev, args.batch_size,
         )
-        # Shared 3D-CTF: identical for even and odd, so reconstructed once per position.
-        # Two independent reconstructions, one per box size (ctf_crop is not a resize of ctf).
+        # Shared 3D-CTF: identical for even and odd, so reconstructed once per position, at
+        # crop_box_size (fit-model never uses a native-box-size CTF).
         ctf_vols = batched_reconstruct(
-            lambda p: ts.reconstruct_subvolume_ctfs_single(p, pixel_size=args.pixel_size, size=args.box_size, apply_ctf=True),
-            positions_dev, args.batch_size,
-        )
-        ctf_crop_vols = batched_reconstruct(
             lambda p: ts.reconstruct_subvolume_ctfs_single(p, pixel_size=args.pixel_size, size=args.crop_box_size, apply_ctf=True),
             positions_dev, args.batch_size,
         )
@@ -176,7 +171,6 @@ def main() -> None:
             torch.save(even_vols[local_idx].clone(), dirs["subtomo0"] / f"{out_idx}.pt")
             torch.save(odd_vols[local_idx].clone(), dirs["subtomo1"] / f"{out_idx}.pt")
             torch.save(ctf_vols[local_idx].clone(), dirs["ctf"] / f"{out_idx}.pt")
-            torch.save(ctf_crop_vols[local_idx].clone(), dirs["ctf_crop"] / f"{out_idx}.pt")
 
     n_fit = len(tasks) - n_val
     print(f"Done: {n_fit} fitting, {n_val} val subvolumes from {len(entries)} tilt series.")

@@ -49,9 +49,6 @@ def refine_tomogram(
             help="Size of the cubic subtomograms to extract. This should be the same as the subtomo_size used during model fitting."
         ),
     ],
-    mw_angle: Annotated[
-        int, typer.Option(help="Width of the missing wedge in degrees.")
-    ],
     subtomo_overlap: Annotated[
         Optional[int],
         typer.Option(
@@ -152,7 +149,6 @@ def refine_tomogram(
                     tomo_file=t0_file,
                     subtomo_size=subtomo_size,
                     subtomo_extraction_strides=3 * [subtomo_size - subtomo_overlap],
-                    mw_angle=mw_angle,
                     batch_size=batch_size,
                     standardize=standardize_full_tomos,
                     num_workers=num_workers,
