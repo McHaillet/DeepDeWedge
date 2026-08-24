@@ -84,6 +84,13 @@ def main() -> None:
     # to >= 0 for the edge case where the tilt series volume is smaller than one box
     start_coords = torch.round(positions / args.pixel_size - args.box_size / 2).clamp(min=0).to(torch.int64)
     tomo_shape = torch.round(ts.volume_dimensions_physical / args.pixel_size).to(torch.int64)
+    # ts.volume_dimensions_physical (and therefore positions/start_coords/tomo_shape
+    # derived from it above) is ordered X,Y,Z, but the subvolume tensors warpylib's
+    # reconstruct_subvolumes_single actually returns are axis-ordered Z,Y,X.
+    # reassemble_subtomos indexes tensors along their native axes, so start_coords
+    # and tomo_shape must be reversed to Z,Y,X to line up with them.
+    start_coords = start_coords.flip(-1)
+    tomo_shape = tomo_shape.flip(-1)
 
     n = start_coords.shape[0]
     subtomo_files = [args.subtomo_dir / f"{i}.pt" for i in range(n)]
