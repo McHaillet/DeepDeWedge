@@ -1,3 +1,4 @@
+import glob
 import os
 
 import time
@@ -70,7 +71,12 @@ class SubtomoDataset(Dataset):
                 raise ValueError(f"'{subtomo_dir}' must contain a '{sub}' subdirectory.")
 
     def __len__(self):
-        return len(os.listdir(f"{self.subtomo_dir}/subtomo0"))
+        # count only "*.pt" files, not every directory entry: a stray non-'.pt' file (a
+        # hidden dotfile, an NFS silly-rename artifact from a deleted-while-open file, a
+        # leftover from an interrupted run, ...) would otherwise inflate the count past the
+        # number of actual, contiguously-indexed samples, causing __getitem__ to be asked
+        # for an index one-past-the-end that doesn't exist on disk
+        return len(glob.glob(f"{self.subtomo_dir}/subtomo0/*.pt"))
 
     def __getitem__(self, index):
         subtomo0_file = f"{self.subtomo_dir}/subtomo0/{index}.pt"

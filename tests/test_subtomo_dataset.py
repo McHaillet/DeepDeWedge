@@ -39,3 +39,20 @@ def test_item_shapes_and_value_range(make_subtomo_dir):
     # continuous, not a binary wedge
     assert not torch.all((item["ctf"] == 0) | (item["ctf"] == 1))
     assert item["index"] == 0
+
+
+def test_len_ignores_stray_non_pt_files(make_subtomo_dir):
+    """
+    A stray non-'.pt' file in subtomo0/ (a hidden dotfile, an NFS silly-rename artifact, a
+    leftover from an interrupted run, ...) must not inflate __len__ past the actual number
+    of samples - otherwise a sampler would eventually request an index that doesn't exist
+    on disk.
+    """
+    native, crop = 32, 24
+    root = make_subtomo_dir(native_size=native, crop_size=crop, n_fitting=4, n_val=0)
+    subtomo0_dir = root / "fitting_subtomos" / "subtomo0"
+    (subtomo0_dir / ".nfs0000000012345678").write_bytes(b"")
+    (subtomo0_dir / ".DS_Store").write_bytes(b"")
+
+    ds = SubtomoDataset(subtomo_dir=str(root / "fitting_subtomos"))
+    assert len(ds) == 4
