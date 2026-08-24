@@ -11,9 +11,13 @@ inputs, so no position bookkeeping needs to have been saved during
 extraction. --subtomo-dir must contain exactly one file per grid position,
 index-matched in the same grid order (0.pt, 1.pt, ...).
 
-Overlapping subvolumes are blended: uniformly averaged by default, or with a
-linear ramp towards each subvolume's edges if --subtomo-overlap (in voxels)
-is given (see ddw.utils.subtomos.reassemble_subtomos).
+Overlapping subvolumes are blended with a linear ramp towards each
+subvolume's edges (see ddw.utils.subtomos.reassemble_subtomos). The ramp
+width, in voxels, is derived from --overlap and --box-size the same way the
+grid spacing itself is: neighboring boxes are spaced box_size * (1 - overlap)
+voxels apart, so they overlap by round(box_size * overlap) voxels - this is
+not a separate parameter to tune, it must produce the same overlap that was
+actually used to build the grid.
 
 Since make_even_odd_subtomos_single.py reconstructs each subvolume at a
 sub-voxel-precise physical position (independent per-position backprojection,
@@ -24,8 +28,8 @@ a sub-voxel-accurate reconstruction.
 
 Usage:
     python reassemble_tomogram.py /path/to/tilt_series.xml --pixel-size 10.0 \\
-        --box-size 136 --subtomo-dir refined_subtomos \\
-        --output-file refined_tomogram.mrc --subtomo-overlap 14
+        --box-size 136 --overlap 0.1 --subtomo-dir refined_subtomos \\
+        --output-file refined_tomogram.mrc
 """
 
 import argparse
@@ -67,7 +71,6 @@ def main() -> None:
     parser.add_argument("--overlap", type=float, default=0.1, help="Same --overlap used for extraction (default: 0.1)")
     parser.add_argument("--subtomo-dir", type=Path, required=True, help="Directory of index-matched (0.pt, 1.pt, ...) subvolumes to reassemble")
     parser.add_argument("--output-file", type=Path, required=True, help="Path to save the reassembled tomogram (.mrc)")
-    parser.add_argument("--subtomo-overlap", type=int, default=None, help="Width, in voxels, of the linear-ramp blend applied at each subvolume's edges where it overlaps its neighbors. If not given, overlaps are averaged uniformly.")
     parser.add_argument("--device", type=str, default="cpu", help="torch device used to read the tilt series metadata, e.g. 'cpu', 'cuda', 'cuda:0' (default: cpu)")
     args = parser.parse_args()
 
@@ -99,10 +102,15 @@ def main() -> None:
                 f"{tuple(subtomo.shape)} in '{file}'."
             )
 
+    # same overlap, in voxels, that spacing the grid by box_size * (1 - overlap)
+    # actually produces between neighboring boxes; None (no ramp, uniform average)
+    # if --overlap is 0, since reassemble_subtomos' ramp requires a nonzero width.
+    subtomo_overlap = round(args.box_size * args.overlap) or None
+
     tomo = reassemble_subtomos(
         subtomos=subtomos,
         subtomo_start_coords=start_coords.tolist(),
-        subtomo_overlap=args.subtomo_overlap,
+        subtomo_overlap=subtomo_overlap,
         crop_to_size=tomo_shape.tolist(),
     )
 
