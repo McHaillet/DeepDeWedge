@@ -152,6 +152,11 @@ class LitUnet3D(pl.LightningModule):
         """
         Update a hyperparameter in the hparams.yaml file.
         """
+        if not self.trainer.is_global_zero:
+            # under DDP this hook runs on every rank, but the logger only writes
+            # hparams.yaml on rank 0 (its log_hyperparams is @rank_zero_only), so on
+            # other ranks the file is empty/not yet written - skip them here
+            return
         logger = self.trainer.logger
         logdir = f"{logger.save_dir}/{logger.name}/version_{logger.version}"
         hparams_file = f"{logdir}/hparams.yaml"
