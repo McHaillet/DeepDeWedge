@@ -227,9 +227,9 @@ class Unet3D(torch.nn.Module):
             ch *= 2
 
         self.bottleneck = nn.Sequential(
-            nn.Conv3d(ch, ch * 2, kernel_size=(3, 3, 3), padding=1),
+            nn.Conv3d(ch, ch * 2, kernel_size=(3, 3, 3), padding=1, bias=False),
             nn.LeakyReLU(negative_slope=0.05, inplace=True),
-            nn.Conv3d(ch * 2, ch, kernel_size=(3, 3, 3), padding=1),
+            nn.Conv3d(ch * 2, ch, kernel_size=(3, 3, 3), padding=1, bias=False),
         )
 
         self.up_blocks = nn.ModuleList()
@@ -242,7 +242,7 @@ class Unet3D(torch.nn.Module):
         self.up_blocks.append(UpConvBlock(2 * ch, ch, self.drop_prob))
 
         self.final_conv = nn.Conv3d(
-            ch, self.out_chans, kernel_size=(1, 1, 1), stride=(1, 1, 1)
+            ch, self.out_chans, kernel_size=(1, 1, 1), stride=(1, 1, 1), bias=False
         )
 
     def normalize(self, volume: torch.Tensor) -> torch.Tensor:
@@ -287,16 +287,13 @@ class DownConvBlock(nn.Module):
         self.drop_prob = drop_prob
 
         self.layers = nn.Sequential(
-            nn.Conv3d(in_chans, out_chans, kernel_size=(3, 3, 3), padding=1),
-            nn.InstanceNorm3d(out_chans),
+            nn.Conv3d(in_chans, out_chans, kernel_size=(3, 3, 3), padding=1, bias=False),
             nn.Dropout3d(drop_prob),
             nn.LeakyReLU(negative_slope=0.05, inplace=True),
-            nn.Conv3d(out_chans, out_chans, kernel_size=(3, 3, 3), padding=1),
-            nn.InstanceNorm3d(out_chans),
+            nn.Conv3d(out_chans, out_chans, kernel_size=(3, 3, 3), padding=1, bias=False),
             nn.Dropout3d(drop_prob),
             nn.LeakyReLU(negative_slope=0.05, inplace=True),
-            nn.Conv3d(out_chans, out_chans, kernel_size=(3, 3, 3), padding=1),
-            nn.InstanceNorm3d(out_chans),
+            nn.Conv3d(out_chans, out_chans, kernel_size=(3, 3, 3), padding=1, bias=False),
             nn.Dropout3d(drop_prob),
             nn.LeakyReLU(negative_slope=0.05, inplace=True),
         )
@@ -314,16 +311,13 @@ class UpConvBlock(nn.Module):
         self.drop_prob = drop_prob
 
         self.layers = nn.Sequential(
-            nn.Conv3d(in_chans, in_chans // 2, kernel_size=(3, 3, 3), padding=1),
-            nn.InstanceNorm3d(in_chans // 2),
+            nn.Conv3d(in_chans, in_chans // 2, kernel_size=(3, 3, 3), padding=1, bias=False),
             nn.Dropout3d(drop_prob),
             nn.LeakyReLU(negative_slope=0.05, inplace=True),
-            nn.Conv3d(in_chans // 2, in_chans // 2, kernel_size=(3, 3, 3), padding=1),
-            nn.InstanceNorm3d(in_chans // 2),
+            nn.Conv3d(in_chans // 2, in_chans // 2, kernel_size=(3, 3, 3), padding=1, bias=False),
             nn.Dropout3d(drop_prob),
             nn.LeakyReLU(negative_slope=0.05, inplace=True),
-            nn.Conv3d(in_chans // 2, out_chans, kernel_size=(3, 3, 3), padding=1),
-            nn.InstanceNorm3d(out_chans),
+            nn.Conv3d(in_chans // 2, out_chans, kernel_size=(3, 3, 3), padding=1, bias=False),
             nn.Dropout3d(drop_prob),
             nn.LeakyReLU(negative_slope=0.05, inplace=True),
         )
@@ -336,7 +330,7 @@ class SpatialDownSampling(nn.Module):
     def __init__(self, chans: int) -> None:
         super().__init__()
         self.layers = nn.Sequential(
-            nn.Conv3d(chans, chans, kernel_size=(3, 3, 3), stride=(2, 2, 2), padding=1),
+            nn.Conv3d(chans, chans, kernel_size=(3, 3, 3), stride=(2, 2, 2), padding=1, bias=False),
             nn.LeakyReLU(negative_slope=0.05, inplace=True),
         )
 
@@ -355,7 +349,7 @@ class SpatialUpSampling(nn.Module):
         # that unevenness.
         self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
         self.conv = nn.Conv3d(
-            in_chans, out_chans, kernel_size=(3, 3, 3), stride=(1, 1, 1), padding=1
+            in_chans, out_chans, kernel_size=(3, 3, 3), stride=(1, 1, 1), padding=1, bias=False
         )
         self.activation = nn.LeakyReLU(negative_slope=0.05, inplace=True)
 
