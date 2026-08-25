@@ -67,13 +67,55 @@ def test_data_consistency_loss_ignores_zero_ctf_frequencies():
 
 
 def test_equivariance_loss_zero_when_identical():
-    x = torch.randn(4, 6, 6, 6)
-    assert equivariance_loss(x, x).item() == 0.0
-
-
-def test_equivariance_loss_matches_manual_mse():
     torch.manual_seed(0)
-    a = torch.randn(4, 6, 6, 6)
-    b = torch.randn(4, 6, 6, 6)
-    expected = (a - b).pow(2).mean()
-    assert torch.allclose(equivariance_loss(a, b), expected)
+    mask = torch.rand(6, 6, 4).clamp(0, 1)
+    x = torch.randn(4, 6, 6, 6)
+    assert equivariance_loss(x, x, mask).item() == 0.0
+
+
+def test_equivariance_loss_matches_manual_fourier_mse():
+    torch.manual_seed(0)
+    N = 8
+    mask = torch.rand(N, N, N // 2 + 1).clamp(0, 1)
+    a = torch.randn(4, N, N, N)
+    b = torch.randn(4, N, N, N)
+    diff_ft = torch.fft.rfftn(a - b, dim=(-3, -2, -1), norm="ortho")
+    expected = (mask * diff_ft).abs().pow(2).mean()
+    assert torch.allclose(equivariance_loss(a, b, mask), expected)
+
+
+def test_equivariance_loss_ignores_zero_mask_frequencies():
+    """
+    Where 'mask' is exactly zero, that frequency must not contribute to the loss, regardless
+    of how much 'x_double_hat' and 'target' disagree there - 'mask' is a comparison weight
+    only, not applied as a forward operator to either side beforehand.
+    """
+    torch.manual_seed(0)
+    N = 8
+    mask = torch.zeros(N, N, N // 2 + 1)
+    mask[:, :, : N // 4] = 1.0
+
+    a = torch.randn(N, N, N)
+    b = torch.randn(N, N, N)
+    loss_ab = equivariance_loss(a, b, mask)
+
+    delta_freq = torch.fft.rfftn(torch.randn(N, N, N), norm="ortho") * (1 - mask)
+    delta = torch.fft.irfftn(delta_freq, s=(N, N, N), norm="ortho")
+    loss_ab_perturbed = equivariance_loss(a + delta, b, mask)
+    assert torch.allclose(loss_ab, loss_ab_perturbed, atol=1e-4)
+
+
+def test_equivariance_loss_scale_matches_real_space_mse():
+    """
+    With an all-ones 'mask' and 'norm="ortho"', the Fourier-domain loss lands on approximately
+    the same scale as a plain real-space MSE (matching data_consistency_loss's scale) - see
+    equivariance_loss's docstring on why rfftn + '.mean()' achieves this.
+    """
+    torch.manual_seed(0)
+    N = 32
+    mask = torch.ones(N, N, N // 2 + 1)
+    a = torch.randn(N, N, N)
+    b = torch.randn(N, N, N)
+    fourier_loss = equivariance_loss(a, b, mask)
+    real_space_mse = (a - b).pow(2).mean()
+    assert torch.allclose(fourier_loss, real_space_mse, rtol=0.05)

@@ -70,12 +70,13 @@ def fit_model(
             help="Path to the directory where the model checkpoints and logs will be saved. If logdir is not provided, logdir is set to '{project_dir}/logs'."
         ),
     ] = None,
-    eq_loss_weight: Annotated[
+    lambda_: Annotated[
         float,
         typer.Option(
-            help="Weight (lambda) of the equivariance loss term relative to the data-consistency loss term: total loss = data_consistency_loss + eq_loss_weight * equivariance_loss."
+            "--lambda",
+            help="Weight of the equivariance loss term relative to the data-consistency loss term: total loss = data_consistency_loss + lambda * equivariance_loss."
         ),
-    ] = 1.0,
+    ] = 2.0,
     logger: Annotated[
         str,
         typer.Option(
@@ -234,7 +235,7 @@ def fit_model(
         unet_params=unet_params_dict,
         adam_params=adam_params_dict,
         subtomo_size=subtomo_size,
-        eq_loss_weight=eq_loss_weight,
+        lambda_=lambda_,
     )
     # initialize the trainer
     devices = [gpu] if isinstance(gpu, int) else gpu

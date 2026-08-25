@@ -21,13 +21,13 @@ class LitUnet3D(pl.LightningModule):
         unet_params,
         adam_params,
         subtomo_size,
-        eq_loss_weight=1.0,
+        lambda_=2.0,
     ):
         super().__init__()
         self.unet_params = unet_params
         self.adam_params = adam_params
         self.subtomo_size = subtomo_size
-        self.eq_loss_weight = eq_loss_weight
+        self.lambda_ = lambda_
         self.unet = Unet3D(**self.unet_params)
         # self.ema = ExponentialMovingAverage(self.unet.parameters(), decay=0.995)
         self.save_hyperparameters()
@@ -37,16 +37,28 @@ class LitUnet3D(pl.LightningModule):
             1
         )  # unsqueeze to add channel dimension, squeeze to remove it
 
-    def _rotate_batch(self, vol_batch, indices, deterministic):
+    def _sample_rotations(self, indices, deterministic):
         """
-        Rotates each volume in 'vol_batch' by an independently sampled grid rotation (see
-        ddw.utils.rotation.get_grid_rotations). This is exact (no interpolation), so the
-        output has exactly the same shape as the input and needs no cropping.
+        Samples one grid rotation per volume (see ddw.utils.rotation.get_grid_rotations).
+        Callers that need to later undo the same rotation (via _rotate_batch's 'inverse')
+        must reuse the returned list rather than re-sampling by 'index': when 'deterministic'
+        is False, sample_grid_rotation draws from the shared global 'random' state, so two
+        separate calls - even with the same 'index' - are not guaranteed to agree.
         """
-        rotated = [
-            rotate_vol(vol, sample_grid_rotation(int(index), deterministic))
-            for vol, index in zip(vol_batch, indices)
-        ]
+        return [sample_grid_rotation(int(index), deterministic) for index in indices]
+
+    def _rotate_batch(self, vol_batch, rot_mats, inverse=False):
+        """
+        Rotates each volume in 'vol_batch' by the corresponding matrix in 'rot_mats' (from
+        _sample_rotations). This is exact (no interpolation), so the output has exactly the
+        same shape as the input and needs no cropping. If 'inverse' is True, applies the
+        inverse rotation instead (the transpose of the signed permutation matrix, which
+        exactly undoes rotate_vol for these grid-aligned rotations) - pass the *same*
+        'rot_mats' used for the corresponding forward call so the two exactly cancel.
+        """
+        rotated = []
+        for vol, rot_mat in zip(vol_batch, rot_mats):
+            rotated.append(rotate_vol(vol, rot_mat.T if inverse else rot_mat))
         return torch.stack(rotated)
 
     def _step(self, batch, batch_idx, deterministic):
@@ -59,21 +71,30 @@ class LitUnet3D(pl.LightningModule):
 
         dc_loss = data_consistency_loss(x_hat0, x_hat1, subtomo0, subtomo1, ctf)
 
-        # alternate which of the two estimates feeds the equivariance term each step,
-        # bounding compute to 3 (rather than 4) forward passes of the model
-        use_branch0 = (
+        # alternate which estimate is rotated + re-degraded to build the equivariance term's
+        # model input ("x_hat2") vs. which (the *other*, independent-noise) estimate serves as
+        # its target ("x_hat1"), bounding compute to 3 (rather than 4) forward passes of the
+        # model
+        use_branch0_as_source = (
             (batch_idx % 2 == 0) if deterministic else (random.random() < 0.5)
         )
-        x_hat = x_hat0 if use_branch0 else x_hat1
-        # rotate_vol/_rotate_batch is differentiable, but x_hat is detached here anyway by
-        # design (standard equivariant-imaging stop-gradient): the gradient of eq_loss should
-        # only flow through the second application of self() below
-        x_hat_rot = self._rotate_batch(x_hat.detach(), batch["index"], deterministic)
-        z = apply_fourier_mask_to_tomo(x_hat_rot, ctf)
-        x_double_hat = self(z)
-        eq_loss = equivariance_loss(x_double_hat, x_hat_rot)
+        x_hat_source = x_hat0 if use_branch0_as_source else x_hat1
+        x_hat_target = x_hat1 if use_branch0_as_source else x_hat0
 
-        loss = dc_loss + self.eq_loss_weight * eq_loss
+        # sampled once and reused for both the forward and inverse rotation below, so they
+        # are guaranteed to exactly cancel (see _sample_rotations)
+        rot_mats = self._sample_rotations(batch["index"], deterministic)
+
+        # rotate_vol/_rotate_batch is differentiable, but both estimates are detached here
+        # anyway by design (standard equivariant-imaging stop-gradient): the gradient of
+        # eq_loss should only flow through the second application of self() below
+        x_hat_source_rot = self._rotate_batch(x_hat_source.detach(), rot_mats)
+        z = apply_fourier_mask_to_tomo(x_hat_source_rot, ctf)
+        x_double_hat = self(z)
+        x_double_hat_unrot = self._rotate_batch(x_double_hat, rot_mats, inverse=True)
+        eq_loss = equivariance_loss(x_double_hat_unrot, x_hat_target.detach(), ctf)
+
+        loss = dc_loss + self.lambda_ * eq_loss
         return loss, dc_loss, eq_loss
 
     def training_step(self, batch, batch_idx):

@@ -18,7 +18,7 @@ requires_gpu = pytest.mark.skipif(
 )
 
 
-def _fit_kwargs(subtomo_dir, logdir, crop_size, num_downsample_layers=3, eq_loss_weight=1.0):
+def _fit_kwargs(subtomo_dir, logdir, crop_size, num_downsample_layers=3, lambda_=2.0):
     return dict(
         unet_params_dict={"chans": 4, "num_downsample_layers": num_downsample_layers, "drop_prob": 0.0},
         adam_params_dict={"lr": 1e-3},
@@ -31,7 +31,7 @@ def _fit_kwargs(subtomo_dir, logdir, crop_size, num_downsample_layers=3, eq_loss
         logdir=str(logdir),
         logger="csv",
         check_val_every_n_epochs=1,
-        eq_loss_weight=eq_loss_weight,
+        lambda_=lambda_,
         save_model_every_n_epochs=100,
         save_n_models_with_lowest_fitting_loss=0,
         save_n_models_with_lowest_val_loss=0,
