@@ -41,7 +41,7 @@ def _fit_kwargs(subtomo_dir, logdir, crop_size, num_downsample_layers=3, eq_loss
 
 def test_fit_model_requires_ctf_dir(make_subtomo_dir, tmp_path):
     # raises before the Trainer/GPU is ever touched, so no GPU needed here
-    root = make_subtomo_dir(native_size=32, crop_size=24, n_fitting=4, n_val=0)
+    root = make_subtomo_dir(native_size=24, crop_size=24, n_fitting=4, n_val=0)
     shutil.rmtree(root / "fitting_subtomos" / "ctf")
     with pytest.raises(ValueError, match="ctf"):
         fit_model(**_fit_kwargs(root, tmp_path / "logs", crop_size=24))
@@ -49,7 +49,7 @@ def test_fit_model_requires_ctf_dir(make_subtomo_dir, tmp_path):
 
 @requires_gpu
 def test_fit_model_completes(make_subtomo_dir, tmp_path):
-    root = make_subtomo_dir(native_size=32, crop_size=24, n_fitting=6, n_val=2)
+    root = make_subtomo_dir(native_size=24, crop_size=24, n_fitting=6, n_val=2)
     fit_model(**_fit_kwargs(root, tmp_path / "logs", crop_size=24))
 
 
@@ -62,8 +62,11 @@ def test_fit_model_raises_on_indivisible_native_size(make_subtomo_dir, tmp_path)
         fit_model(**_fit_kwargs(root, tmp_path / "logs", crop_size=24))
 
 
-def test_fit_model_raises_when_native_size_not_larger_than_crop_size(make_subtomo_dir, tmp_path):
-    # raises before the Trainer/GPU is ever touched, so no GPU needed here
-    root = make_subtomo_dir(native_size=24, crop_size=24, n_fitting=6, n_val=2)
-    with pytest.raises(ValueError, match="larger"):
+def test_fit_model_raises_when_native_size_not_equal_to_subtomo_size(make_subtomo_dir, tmp_path):
+    # raises before the Trainer/GPU is ever touched, so no GPU needed here. The model is run
+    # directly on the on-disk subtomo0/subtomo1 every step, rotating its own estimate in
+    # place with an exact, shape-preserving grid rotation (see ddw.utils.rotation), so the
+    # on-disk size must equal subtomo_size - no cropping happens anymore.
+    root = make_subtomo_dir(native_size=32, crop_size=24, n_fitting=6, n_val=2)
+    with pytest.raises(ValueError, match="equal"):
         fit_model(**_fit_kwargs(root, tmp_path / "logs", crop_size=24))

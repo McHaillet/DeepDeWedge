@@ -177,10 +177,10 @@ def fit_model(
     if val_data_exists:
         val_dataset = SubtomoDataset(subtomo_dir=f"{subtomo_dir}/val_subtomos")
 
-    # the model is run directly on the native, on-disk subtomo0/subtomo1 every step (see
-    # LitUnet3D._step), so their native size - not just subtomo_size - must be compatible
-    # with the U-Net architecture, and must be larger than subtomo_size to leave room for
-    # rotating the model's own estimate without zero-padding artifacts
+    # the model is run directly on the on-disk subtomo0/subtomo1 every step (see
+    # LitUnet3D._step), rotating its own estimate in place with one of the 20 grid-aligned
+    # rotations from ddw.utils.rotation.get_grid_rotations - exact (no interpolation) and
+    # shape-preserving, so the on-disk size must simply equal subtomo_size
     native_size = fitting_dataset[0]["subtomo0"].shape[-1]
     if native_size % factor != 0:
         raise ValueError(
@@ -188,11 +188,10 @@ def fit_model(
             f"2**num_downsample_layers ({factor}) to ensure compatibility with the "
             "U-Net architecture. Extract your sub-tomograms at a compatible size."
         )
-    if native_size <= subtomo_size:
+    if native_size != subtomo_size:
         raise ValueError(
-            f"The on-disk sub-tomogram size ({native_size}) must be larger than "
-            f"subtomo_size ({subtomo_size}) to leave room for rotating the model's "
-            "own estimate without zero-padding artifacts."
+            f"The on-disk sub-tomogram size ({native_size}) must be equal to "
+            f"subtomo_size ({subtomo_size})."
         )
     # setup callbacks
     callbacks = []

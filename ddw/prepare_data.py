@@ -72,12 +72,6 @@ def prepare_data(
             help="Whether to pad the tomograms before extracting subtomograms."
         ),
     ] = False,
-    extract_larger_subtomos_for_rotating: Annotated[
-        bool,
-        typer.Option(
-            help="If True, larger subtomograms with a size of 'subtomo_size*sqrt(2)' will be extracted in order to avoid boundary effects when rotating the subtomograms."
-        ),
-    ] = True,
     standardize_full_tomos: Annotated[
         bool,
         typer.Option(
@@ -161,7 +155,6 @@ def prepare_data(
             tomo=tomo0,
             subtomo_size=subtomo_size,
             subtomo_extraction_strides=subtomo_extraction_strides,
-            enlarge_subtomos_for_rotating=extract_larger_subtomos_for_rotating,
             pad_before_subtomo_extraction=pad_before_subtomo_extraction,
         )
         tomo1 = load_mrc_data(tomo1_file).float()
@@ -172,7 +165,6 @@ def prepare_data(
             tomo=tomo1,
             subtomo_size=subtomo_size,
             subtomo_extraction_strides=subtomo_extraction_strides,
-            enlarge_subtomos_for_rotating=extract_larger_subtomos_for_rotating,
             pad_before_subtomo_extraction=pad_before_subtomo_extraction,
         )
         if mask_file is not None:
@@ -185,7 +177,6 @@ def prepare_data(
             tomo=mask,
             subtomo_size=subtomo_size,
             subtomo_extraction_strides=subtomo_extraction_strides,
-            enlarge_subtomos_for_rotating=extract_larger_subtomos_for_rotating,
             pad_before_subtomo_extraction=pad_before_subtomo_extraction,
         )
         selected_subtomo_ids = [

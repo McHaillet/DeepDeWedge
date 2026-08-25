@@ -21,7 +21,6 @@ def get_avg_model_input_mean_and_std(tomo_file, subtomo_size, subtomo_extraction
         tomo=tomo,
         subtomo_size=subtomo_size,
         subtomo_extraction_strides=subtomo_extraction_strides,
-        enlarge_subtomos_for_rotating=False,
         pad_before_subtomo_extraction=True,
     )
     dataset = TensorDataset(torch.stack(subtomos))

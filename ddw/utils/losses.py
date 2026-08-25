@@ -28,14 +28,14 @@ def equivariance_loss(x_double_hat, x_hat_rotated):
     of the model's own estimates, re-masked with the canonical 'ctf' and passed through the
     model a second time to produce 'x_double_hat'. Matching these teaches the model to fill
     in 'ctf''s (anisotropic) null space, without ever rotating 'ctf' itself - only real-space
-    volumes are rotated, since rotating a continuous CTF/mask array by interpolation (as the
-    old rot_mw_mask scheme did) is itself an approximation. It's fine for 'ctf''s own
-    (rotation-invariant) zero-crossings to stay unfilled: there's no real data there in
-    either representation, and this loss doesn't force them to be recovered.
+    volumes are rotated, using one of 20 grid-aligned rotations (see rotate_vol) applied
+    exactly, without interpolation. It's fine for 'ctf''s own (rotation-invariant)
+    zero-crossings to stay unfilled: there's no real data there in either representation, and
+    this loss doesn't force them to be recovered.
 
-    Rotation is not differentiable (see rotate_vol_around_axis, which uses
-    scipy.ndimage.affine_transform), so 'x_hat_rotated' must be constructed from a detached
-    estimate by the caller. This loss's gradient therefore only flows through the *second*
+    'x_hat_rotated' must be constructed from a detached estimate by the caller - a standard
+    equivariant-imaging stop-gradient, not a limitation of rotate_vol (which is itself
+    differentiable). This loss's gradient therefore only flows through the *second*
     application of the model (the one producing 'x_double_hat'), training it to be
     equivariant with respect to its own (stop-gradient) estimate.
     """

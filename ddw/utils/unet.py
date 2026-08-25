@@ -8,8 +8,7 @@ from torch import nn
 from .fourier import apply_fourier_mask_to_tomo
 from .losses import data_consistency_loss, equivariance_loss
 from .normalization import get_avg_model_input_mean_and_std_from_dataloader
-from .rotation import rotate_vol_around_axis
-from .subtomo_dataset import sample_rot_axis_and_angle
+from .rotation import rotate_vol, sample_grid_rotation
 
 
 class LitUnet3D(pl.LightningModule):
@@ -38,65 +37,38 @@ class LitUnet3D(pl.LightningModule):
             1
         )  # unsqueeze to add channel dimension, squeeze to remove it
 
-    def _center_crop(self, vol):
-        """
-        Center-crops the last 3 dims of 'vol' (native/on-disk size) down to
-        'self.subtomo_size'.
-        """
-        size = self.subtomo_size
-        offsets = [(s - size) // 2 for s in vol.shape[-3:]]
-        return vol[
-            ...,
-            offsets[0] : offsets[0] + size,
-            offsets[1] : offsets[1] + size,
-            offsets[2] : offsets[2] + size,
-        ]
-
     def _rotate_batch(self, vol_batch, indices, deterministic):
         """
-        Rotates each volume in 'vol_batch' by an independently sampled rotation, cropping
-        down to 'self.subtomo_size'. Uses rotate_vol_around_axis, which is not
-        differentiable and requires CPU tensors - 'vol_batch' must already be detached.
+        Rotates each volume in 'vol_batch' by an independently sampled grid rotation (see
+        ddw.utils.rotation.get_grid_rotations). This is exact (no interpolation), so the
+        output has exactly the same shape as the input and needs no cropping.
         """
-        rotated = []
-        for vol, index in zip(vol_batch, indices):
-            rot_axis, rot_angle = sample_rot_axis_and_angle(int(index), deterministic)
-            rotated.append(
-                rotate_vol_around_axis(
-                    vol.cpu(),
-                    rot_angle=rot_angle,
-                    rot_axis=rot_axis,
-                    output_shape=3 * [self.subtomo_size],
-                )
-            )
-        return torch.stack(rotated).to(vol_batch.device)
+        rotated = [
+            rotate_vol(vol, sample_grid_rotation(int(index), deterministic))
+            for vol, index in zip(vol_batch, indices)
+        ]
+        return torch.stack(rotated)
 
     def _step(self, batch, batch_idx, deterministic):
-        subtomo0_native = batch["subtomo0"]
-        subtomo1_native = batch["subtomo1"]
-        ctf = batch["ctf"]  # native orientation, already at self.subtomo_size
+        subtomo0 = batch["subtomo0"]
+        subtomo1 = batch["subtomo1"]
+        ctf = batch["ctf"]
 
-        x_hat0_native = self(subtomo0_native)
-        x_hat1_native = self(subtomo1_native)
+        x_hat0 = self(subtomo0)
+        x_hat1 = self(subtomo1)
 
-        x_hat0 = self._center_crop(x_hat0_native)
-        x_hat1 = self._center_crop(x_hat1_native)
-        y0 = self._center_crop(subtomo0_native)
-        y1 = self._center_crop(subtomo1_native)
-        dc_loss = data_consistency_loss(x_hat0, x_hat1, y0, y1, ctf)
+        dc_loss = data_consistency_loss(x_hat0, x_hat1, subtomo0, subtomo1, ctf)
 
         # alternate which of the two estimates feeds the equivariance term each step,
         # bounding compute to 3 (rather than 4) forward passes of the model
         use_branch0 = (
             (batch_idx % 2 == 0) if deterministic else (random.random() < 0.5)
         )
-        x_hat_native = x_hat0_native if use_branch0 else x_hat1_native
-        # rotation is not differentiable (see rotate_vol_around_axis / _rotate_batch), so
-        # x_hat_native must be detached here regardless; the gradient of eq_loss therefore
-        # only flows through the second application of self() below
-        x_hat_rot = self._rotate_batch(
-            x_hat_native.detach(), batch["index"], deterministic
-        )
+        x_hat = x_hat0 if use_branch0 else x_hat1
+        # rotate_vol/_rotate_batch is differentiable, but x_hat is detached here anyway by
+        # design (standard equivariant-imaging stop-gradient): the gradient of eq_loss should
+        # only flow through the second application of self() below
+        x_hat_rot = self._rotate_batch(x_hat.detach(), batch["index"], deterministic)
         z = apply_fourier_mask_to_tomo(x_hat_rot, ctf)
         x_double_hat = self(z)
         eq_loss = equivariance_loss(x_double_hat, x_hat_rot)

@@ -220,7 +220,6 @@ def _refine_single_tomogram(
         tomo=tomo.cpu(),
         subtomo_size=subtomo_size,
         subtomo_extraction_strides=3 * [subtomo_size - subtomo_overlap],
-        enlarge_subtomos_for_rotating=False,
         pad_before_subtomo_extraction=True,
     )
     

@@ -1,5 +1,3 @@
-import math
-
 import numpy as np
 import torch
 
@@ -8,16 +6,12 @@ def extract_subtomos(
     tomo,
     subtomo_size,
     subtomo_extraction_strides=None,
-    enlarge_subtomos_for_rotating=False,
     pad_before_subtomo_extraction=False,
 ):
     """
     Extracts sub-tomograms of size 'subtomo_size' using a 3D sliding window approach. The three strides of the sliding window are specified by 'subtomo_extraction_strides', which must be three integers.
-    If 'enlarge_subtomos_for_rotating' is True, sub-tomograms are extracted with shape sqrt(2)*'subtomo_size, so they can be rotated and cropped to 'subtomo_size' without zero-filling.
     """
     # TODO: refactor subtomo_extraction_strides to subtomo_overlap
-    if enlarge_subtomos_for_rotating:
-        subtomo_size = ceil_to_even_integer(math.sqrt(2) * subtomo_size)
     if subtomo_extraction_strides is None:
         subtomo_extraction_strides = 3 * [subtomo_size]
     if pad_before_subtomo_extraction:
@@ -120,13 +114,6 @@ def get_linear_ramp_weights(subtomo_size, subtomo_overlap):
                 )
 
     return torch.from_numpy(weight_map_3d)
-
-
-def ceil_to_even_integer(x):
-    """
-    Produces the smallest even integer i that satisfies i >= x.
-    """
-    return int(math.ceil(x / 2.0) * 2)
 
 
 # def try_to_sample_non_overlapping_subtomo_ids(
