@@ -13,11 +13,14 @@ index-matched in the same grid order (0.pt, 1.pt, ...).
 
 Overlapping subvolumes are blended with a linear ramp towards each
 subvolume's edges (see ddw.utils.subtomos.reassemble_subtomos). The ramp
-width, in voxels, is derived from --overlap and --box-size the same way the
-grid spacing itself is: neighboring boxes are spaced box_size * (1 - overlap)
-voxels apart, so they overlap by round(box_size * overlap) voxels - this is
-not a separate parameter to tune, it must produce the same overlap that was
-actually used to build the grid.
+width, in voxels, is NOT simply round(box_size * overlap): make_grid_positions
+only uses --overlap to pick how many boxes n fit along an axis, then spaces
+those n box centers evenly (torch.linspace) to exactly span the axis, which
+generally tightens the spacing - and so widens the true overlap - beyond the
+nominal box_size * (1 - overlap) step, sometimes by a lot when few boxes fit
+along an axis. The actual per-axis overlap is instead computed directly from
+the grid this script regenerates (see actual_overlap_voxels), so the ramp
+always matches the true overlap and there's no separate parameter to tune.
 
 Since make_even_odd_subtomos_single.py reconstructs each subvolume at a
 sub-voxel-precise physical position (independent per-position backprojection,
@@ -61,6 +64,28 @@ def make_grid_positions(volume_dims: torch.Tensor, box_physical: float, overlap:
             centers = torch.linspace(box_physical / 2.0, length - box_physical / 2.0, n)
         axis_centers.append(centers)
     return torch.cartesian_prod(*axis_centers).reshape(-1, 3)
+
+
+def actual_overlap_voxels(
+    volume_dims: torch.Tensor, box_physical: float, overlap: float, pixel_size: float
+) -> torch.Tensor:
+    """
+    Actual per-axis overlap, in voxels, between neighboring boxes in the grid
+    make_grid_positions builds - NOT round(box_size * overlap). Mirrors
+    make_grid_positions' own n/spacing calculation (must stay in sync with it)
+    to recover the spacing torch.linspace actually produced, since that's
+    generally tighter than the nominal box_physical * (1 - overlap) step.
+    """
+    step = box_physical * (1.0 - overlap)
+    overlaps = []
+    for length in volume_dims.tolist():
+        if length <= box_physical:
+            overlaps.append(0)  # single box on this axis, no neighbor to overlap
+            continue
+        n = math.ceil((length - box_physical) / step) + 1
+        actual_spacing = (length - box_physical) / (n - 1)
+        overlaps.append(round((box_physical - actual_spacing) / pixel_size))
+    return torch.tensor(overlaps, dtype=torch.int64)
 
 
 def main() -> None:
@@ -109,10 +134,12 @@ def main() -> None:
                 f"{tuple(subtomo.shape)} in '{file}'."
             )
 
-    # same overlap, in voxels, that spacing the grid by box_size * (1 - overlap)
-    # actually produces between neighboring boxes; None (no ramp, uniform average)
-    # if --overlap is 0, since reassemble_subtomos' ramp requires a nonzero width.
-    subtomo_overlap = round(args.box_size * args.overlap) or None
+    # actual per-axis overlap in voxels between neighboring boxes in the grid
+    # regenerated above (see actual_overlap_voxels) - X,Y,Z like everything else
+    # derived from volume_dimensions_physical, so flip to Z,Y,X to match
+    # start_coords/tomo_shape/the subtomo tensors' own axis order
+    subtomo_overlap = actual_overlap_voxels(ts.volume_dimensions_physical, box_physical, args.overlap, args.pixel_size)
+    subtomo_overlap = subtomo_overlap.flip(-1).tolist()
 
     tomo = reassemble_subtomos(
         subtomos=subtomos,
