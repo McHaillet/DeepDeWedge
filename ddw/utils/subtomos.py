@@ -97,6 +97,48 @@ def reassemble_subtomos(
     return out_vol
 
 
+def reassemble_subtomos_nearest_center(subtomos, subtomo_start_coords, crop_to_size=None):
+    """
+    Alternative to 'reassemble_subtomos' for combining overlapping sub-tomograms: instead of
+    blending overlapping regions with ramp weights, each output voxel takes its value from
+    whichever covering sub-tomogram's own center is closest (nearest-center / Voronoi
+    assignment - no averaging, exactly one sub-tomogram contributes to each voxel).
+
+    Useful when each sub-tomogram is itself less reliable near its own edges/corners (e.g. a
+    reconstruction artifact that grows with distance from the sub-tomogram's center): blending
+    several such edge-degraded samples together doesn't cancel the degradation the way it
+    would for independent noise, it just compounds it, so picking the single least-degraded
+    sample per voxel is more faithful than a weighted average.
+    """
+    subtomo_size = subtomos[0].shape[0]
+    max_idx = [
+        max(start_idx[i] + subtomo_size for start_idx in subtomo_start_coords)
+        for i in range(3)
+    ]
+    # squared distance of every voxel in a sub-tomogram to its own center - identical for
+    # every sub-tomogram (same size), so build it once
+    center = (subtomo_size - 1) / 2.0
+    offset = torch.arange(subtomo_size, dtype=torch.float32, device=subtomos[0].device) - center
+    dist2 = offset[:, None, None] ** 2 + offset[None, :, None] ** 2 + offset[None, None, :] ** 2
+
+    out_vol = torch.zeros(max_idx, dtype=torch.float32, device=subtomos[0].device)
+    best_dist2 = torch.full(max_idx, float("inf"), dtype=torch.float32, device=subtomos[0].device)
+    for subtomo, start_idx in zip(subtomos, subtomo_start_coords):
+        end_idx = [start + subtomo_size for start in start_idx]
+        region = (
+            slice(start_idx[0], end_idx[0]),
+            slice(start_idx[1], end_idx[1]),
+            slice(start_idx[2], end_idx[2]),
+        )
+        closer = dist2 < best_dist2[region]
+        out_vol[region] = torch.where(closer, subtomo, out_vol[region])
+        best_dist2[region] = torch.where(closer, dist2, best_dist2[region])
+
+    if crop_to_size is not None:
+        out_vol = out_vol[: crop_to_size[0], : crop_to_size[1], : crop_to_size[2]]
+    return out_vol
+
+
 def get_linear_ramp_weights(subtomo_size, subtomo_overlap):
     """
     Produces a cubic 3D tensor containing linear weights used to average overlapping sub-tomogram parts in 'reassemble_subtomos'. 'subtomo_overlap' is a single int (same ramp width on all three axes) or a 3-tuple/list of per-axis ramp widths, axis order matching the subtomo tensor's own axes; a width of 0 disables ramping on that axis (weight 1 everywhere along it).
