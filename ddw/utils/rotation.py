@@ -4,7 +4,7 @@ import random
 import torch
 
 # Sub-tomograms are stored axis-ordered (Z, Y, X) throughout this codebase (see e.g.
-# scripts/reassemble_tomogram.py), and the tilt series is acquired by tilting around the Y
+# scripts/refine_tomogram_single.py), and the tilt series is acquired by tilting around the Y
 # axis - dim 1 of the last 3 dims.
 TILT_AXIS = 1
 
