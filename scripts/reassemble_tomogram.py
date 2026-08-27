@@ -70,7 +70,7 @@ def main() -> None:
     parser.add_argument("xml_file", type=Path, help="Path to the tilt series .xml file used for extraction")
     parser.add_argument("--pixel-size", type=float, required=True, help="Same --pixel-size used for extraction")
     parser.add_argument("--box-size", type=int, required=True, help="Same --box-size used for extraction")
-    parser.add_argument("--overlap", type=float, default=0.1, help="Same --overlap used for extraction (default: 0.1)")
+    parser.add_argument("--overlap", type=float, default=0.5, help="Same --overlap used for extraction (default: 0.5)")
     parser.add_argument("--subtomo-dir", type=Path, required=True, help="Directory of index-matched (0.pt, 1.pt, ...) subvolumes to reassemble")
     parser.add_argument("--output-file", type=Path, required=True, help="Path to save the reassembled tomogram (.mrc)")
     parser.add_argument("--device", type=str, default="cpu", help="torch device used to read the tilt series metadata, e.g. 'cpu', 'cuda', 'cuda:0' (default: cpu)")

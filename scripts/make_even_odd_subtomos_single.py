@@ -25,7 +25,7 @@ always moved back to CPU first, so they load fine regardless of device.
 backprojection call, chunking large tomograms to bound peak device memory
 (default: no chunking, one call for the whole tilt series).
 
-`--oversampling` (default 4.0) is passed straight through to
+`--oversampling` (default 3.0) is passed straight through to
 reconstruct_subvolumes_single: it backprojects from a `--box-size *
 --oversampling` patch and crops back to `--box-size`, which is what gentles
 correct_attenuation's sinc^2 correction near each box's own edges/corners -
@@ -35,7 +35,7 @@ then compounds wherever overlapping subtomos get blended back together.
 
 Usage:
     python make_even_odd_subtomos_single.py /path/to/tilt_series.xml --pixel-size 10.0 \\
-        --box-size 136 --output-dir /path/to/output_dir --oversampling 4.0 \\
+        --box-size 136 --output-dir /path/to/output_dir --oversampling 3.0 \\
         --device cuda --batch-size 32
 """
 
@@ -84,8 +84,8 @@ def main() -> None:
     parser.add_argument("--pixel-size", type=float, required=True, help="Reconstruction pixel size in Angstrom")
     parser.add_argument("--box-size", type=int, required=True, help="Subtomogram box size in pixels (must be even)")
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory to create 'even' and 'odd' subdirectories in")
-    parser.add_argument("--overlap", type=float, default=0.1, help="Minimum fractional overlap between neighboring grid positions, relative to --box-size (default: 0.1)")
-    parser.add_argument("--oversampling", type=float, default=4.0, help="Oversampling passed to reconstruct_subvolumes_single. Backprojects from a --box-size * --oversampling patch and crops back to --box-size, which gentles correct_attenuation's sinc^2 correction (it grows sharply towards each box's own corners) - too low a value leaves every subtomo's corners/edges visibly boosted, which then compounds where overlapping subtomos get blended back together in reassemble_tomogram.py (default: 4.0, vs. reconstruct_subvolumes_single's own default of 2.0)")
+    parser.add_argument("--overlap", type=float, default=0.5, help="Minimum fractional overlap between neighboring grid positions, relative to --box-size (default: 0.5)")
+    parser.add_argument("--oversampling", type=float, default=3.0, help="Oversampling passed to reconstruct_subvolumes_single. Backprojects from a --box-size * --oversampling patch and crops back to --box-size, which gentles correct_attenuation's sinc^2 correction (it grows sharply towards each box's own corners) - too low a value leaves every subtomo's corners/edges visibly boosted, which then compounds where overlapping subtomos get blended back together in reassemble_tomogram.py (default: 3.0, vs. reconstruct_subvolumes_single's own default of 2.0)")
     parser.add_argument("--device", type=str, default="cpu", help="torch device to reconstruct on, e.g. 'cpu', 'cuda', 'cuda:0' (default: cpu)")
     parser.add_argument("--batch-size", type=int, default=None, help="Max grid positions reconstructed in a single backprojection call; splits large tomograms into chunks to bound memory use (default: no chunking)")
     args = parser.parse_args()
