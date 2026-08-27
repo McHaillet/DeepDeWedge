@@ -1,15 +1,14 @@
-import math
+import random
 
 import pytorch_lightning as pl
 import torch
-import tqdm
 import yaml
 from torch import nn
 
 from .fourier import apply_fourier_mask_to_tomo
-from .masked_loss import masked_loss
-from .missing_wedge import get_missing_wedge_mask
+from .losses import data_consistency_loss, equivariance_loss
 from .normalization import get_avg_model_input_mean_and_std_from_dataloader
+from .rotation import rotate_vol, sample_grid_rotation
 
 
 class LitUnet3D(pl.LightningModule):
@@ -21,16 +20,14 @@ class LitUnet3D(pl.LightningModule):
         self,
         unet_params,
         adam_params,
-        subtomo_dir,
-        update_subtomo_missing_wedges_every_n_epochs=10,
+        subtomo_size,
+        lambda_=2.0,
     ):
         super().__init__()
         self.unet_params = unet_params
         self.adam_params = adam_params
-        self.subtomo_dir = subtomo_dir
-        self.update_subtomo_missing_wedges_every_n_epochs = (
-            update_subtomo_missing_wedges_every_n_epochs
-        )
+        self.subtomo_size = subtomo_size
+        self.lambda_ = lambda_
         self.unet = Unet3D(**self.unet_params)
         # self.ema = ExponentialMovingAverage(self.unet.parameters(), decay=0.995)
         self.save_hyperparameters()
@@ -40,48 +37,96 @@ class LitUnet3D(pl.LightningModule):
             1
         )  # unsqueeze to add channel dimension, squeeze to remove it
 
+    def _sample_rotations(self, indices, deterministic):
+        """
+        Samples one grid rotation per volume (see ddw.utils.rotation.get_grid_rotations).
+        Callers that need to later undo the same rotation (via _rotate_batch's 'inverse')
+        must reuse the returned list rather than re-sampling by 'index': when 'deterministic'
+        is False, sample_grid_rotation draws from the shared global 'random' state, so two
+        separate calls - even with the same 'index' - are not guaranteed to agree.
+        """
+        return [sample_grid_rotation(int(index), deterministic) for index in indices]
+
+    def _rotate_batch(self, vol_batch, rot_mats, inverse=False):
+        """
+        Rotates each volume in 'vol_batch' by the corresponding matrix in 'rot_mats' (from
+        _sample_rotations). This is exact (no interpolation), so the output has exactly the
+        same shape as the input and needs no cropping. If 'inverse' is True, applies the
+        inverse rotation instead (the transpose of the signed permutation matrix, which
+        exactly undoes rotate_vol for these grid-aligned rotations) - pass the *same*
+        'rot_mats' used for the corresponding forward call so the two exactly cancel.
+        """
+        rotated = []
+        for vol, rot_mat in zip(vol_batch, rot_mats):
+            rotated.append(rotate_vol(vol, rot_mat.T if inverse else rot_mat))
+        return torch.stack(rotated)
+
+    def _step(self, batch, batch_idx, deterministic):
+        subtomo0 = batch["subtomo0"]
+        subtomo1 = batch["subtomo1"]
+        ctf = batch["ctf"]
+
+        # alternate which estimate is rotated + re-degraded to build the equivariance term's
+        # model input ("x_hat2") vs. which (the *other*, independent-noise) estimate serves as
+        # its target ("x_hat1"), bounding compute to 3 (rather than 4) forward passes of the
+        # model. The same choice also picks which of the two cross-wise data-consistency
+        # pairings dc_loss evaluates this step (rather than always summing both): only the
+        # "source" branch needs gradients for that, so the "target" branch - only ever used
+        # detached, both here and for the equivariance loss below - is computed under
+        # torch.no_grad() to skip unneeded gradient bookkeeping and speed things up slightly.
+        use_branch0_as_source = (
+            (batch_idx % 2 == 0) if deterministic else (random.random() < 0.5)
+        )
+        if use_branch0_as_source:
+            x_hat_source = self(subtomo0)
+            with torch.no_grad():
+                x_hat_target = self(subtomo1)
+        else:
+            x_hat_source = self(subtomo1)
+            with torch.no_grad():
+                x_hat_target = self(subtomo0)
+
+        y_cross = subtomo1 if use_branch0_as_source else subtomo0
+        dc_loss = data_consistency_loss(x_hat_source, y_cross, ctf)
+
+        # sampled once and reused for both the forward and inverse rotation below, so they
+        # are guaranteed to exactly cancel (see _sample_rotations)
+        rot_mats = self._sample_rotations(batch["index"], deterministic)
+
+        # rotate_vol/_rotate_batch is differentiable, but both estimates are detached here
+        # anyway by design (standard equivariant-imaging stop-gradient): the gradient of
+        # eq_loss should only flow through the second application of self() below
+        x_hat_source_rot = self._rotate_batch(x_hat_source.detach(), rot_mats)
+        z = apply_fourier_mask_to_tomo(x_hat_source_rot, ctf)
+        x_double_hat = self(z)
+        x_double_hat_unrot = self._rotate_batch(x_double_hat, rot_mats, inverse=True)
+        eq_loss = equivariance_loss(x_double_hat_unrot, x_hat_target.detach(), ctf)
+
+        loss = dc_loss + self.lambda_ * eq_loss
+        return loss, dc_loss, eq_loss
+
     def training_step(self, batch, batch_idx):
-        model_output = self(batch["model_input"])
-        loss = masked_loss(
-            model_output=model_output,
-            target=batch["model_target"],
-            rot_mw_mask=batch["rot_mw_mask"],
-            mw_mask=batch["mw_mask"],
-        )
-        self.log(
-            "fitting_loss",
-            loss,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-        )
+        loss, dc_loss, eq_loss = self._step(batch, batch_idx, deterministic=False)
+        # sync_dist=True: under multi-GPU DDP each rank only sees its own shard, so without
+        # this the ModelCheckpoint callbacks that monitor "fitting_loss"/"val_loss" (see
+        # fit_model.py) would select checkpoints based on a single rank's partial view of
+        # the loss instead of the true value averaged across all ranks
+        self.log("fitting_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log("fitting_dc_loss", dc_loss, on_step=False, on_epoch=True, logger=True, sync_dist=True)
+        self.log("fitting_eq_loss", eq_loss, on_step=False, on_epoch=True, logger=True, sync_dist=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        model_output = self(batch["model_input"])
-        loss = masked_loss(
-            model_output=model_output,
-            target=batch["model_target"],
-            rot_mw_mask=batch["rot_mw_mask"],
-            mw_mask=batch["mw_mask"],
-        )
-        self.log(
-            "val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True
-        )
+        loss, dc_loss, eq_loss = self._step(batch, batch_idx, deterministic=True)
+        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log("val_dc_loss", dc_loss, on_step=False, on_epoch=True, logger=True, sync_dist=True)
+        self.log("val_eq_loss", eq_loss, on_step=False, on_epoch=True, logger=True, sync_dist=True)
 
     # def on_before_zero_grad(self, optimizer) -> None:
     #     self.ema.update()
 
     def on_train_start(self) -> None:
         if self.current_epoch == 0:
-            self.update_normalization()
-
-    def on_train_epoch_end(self) -> None:
-        if (
-            self.current_epoch + 1
-        ) % self.update_subtomo_missing_wedges_every_n_epochs == 0:  # +1 because the epoch indexing starts at 0
-            self.update_subtomo_missing_wedges()
             self.update_normalization()
 
     def configure_optimizers(self):
@@ -92,62 +137,6 @@ class LitUnet3D(pl.LightningModule):
     # def lr_scheduler_step(self, scheduler, optimizer_idx, metric) -> None:
     #     if scheduler is not None:
     #         scheduler.step()
-
-    def update_subtomo_missing_wedges(self):
-        """
-        Update the missing wedges of model input subtomos.
-        """
-        # we don't want to rotate the subtomos when updating them, so we create new dataloader objects with rotate_subtomos=False
-        datasets = []
-        train_loader = self.trainer.train_dataloader.loaders
-        train_set = train_loader.dataset
-        train_set.rotate_subtomos = False
-        datasets.append(train_set)
-        # val_dataloaders may be None
-        if self.trainer.val_dataloaders is not None:
-            val_loader = self.trainer.val_dataloaders[0]
-            val_set = val_loader.dataset
-            val_set.rotate_subtomos = False
-            datasets.append(val_set)
-        dataset = torch.utils.data.ConcatDataset(datasets)
-        loader = torch.utils.data.DataLoader(
-            dataset,
-            batch_size=train_loader.batch_size,
-            num_workers=train_loader.num_workers,
-        )
-        # subtomo size has to be divisible by 2**num_downsample_layers due to U-Net architecture -> ensure this by padding
-        subtomo_dim = dataset[0]["model_input"].shape[-1]
-        factor = 2 ** self.unet_params["num_downsample_layers"]
-        padding = factor * math.ceil(subtomo_dim / factor) - subtomo_dim
-        # also make larger missing wedge mask that is compatible with the padded subtomos
-        mw_mask = get_missing_wedge_mask(grid_size=3*[subtomo_dim + padding], mw_angle=train_set.mw_angle)
-        with torch.no_grad():
-            for batch in tqdm.tqdm(loader, desc="Updating subtomo missing wedges"):
-                assert batch["rot_angle"].float().norm() == 0
-                subtomo_batch = batch["model_input"].to(self.device)
-                subtomo_batch = torch.nn.functional.pad(
-                    subtomo_batch,
-                    pad=(0, padding, 0, padding, 0, padding),
-                    mode="constant",
-                    value=0,
-                )
-                # repeat missing wedge mask for each subtomo in the batch
-                mw_mask_batch = mw_mask.repeat((*subtomo_batch.shape[:-3], 1, 1, 1)).to(subtomo_batch.device)
-                # forward pass
-                subtomo_batch_ref = self.forward(subtomo_batch)
-                # update missing wedges    
-                subtomo_batch = apply_fourier_mask_to_tomo(
-                    subtomo_batch, mw_mask_batch
-                ) + apply_fourier_mask_to_tomo(subtomo_batch_ref, 1 - mw_mask_batch)
-                # remove padding
-                subtomo_batch = subtomo_batch[
-                    ..., :subtomo_dim, :subtomo_dim, :subtomo_dim
-                ]
-                for subtomo, file in zip(subtomo_batch, batch["subtomo0_file"]):
-                    torch.save(subtomo.cpu().clone(), file)
-        train_set.rotate_subtomos = True
-        if self.trainer.val_dataloaders is not None:
-            val_set.rotate_subtomos = True
 
     def update_normalization(self):
         """
@@ -171,6 +160,11 @@ class LitUnet3D(pl.LightningModule):
         """
         Update a hyperparameter in the hparams.yaml file.
         """
+        if not self.trainer.is_global_zero:
+            # under DDP this hook runs on every rank, but the logger only writes
+            # hparams.yaml on rank 0 (its log_hyperparams is @rank_zero_only), so on
+            # other ranks the file is empty/not yet written - skip them here
+            return
         logger = self.trainer.logger
         logdir = f"{logger.save_dir}/{logger.name}/version_{logger.version}"
         hparams_file = f"{logdir}/hparams.yaml"
@@ -241,9 +235,9 @@ class Unet3D(torch.nn.Module):
             ch *= 2
 
         self.bottleneck = nn.Sequential(
-            nn.Conv3d(ch, ch * 2, kernel_size=(3, 3, 3), padding=1),
+            nn.Conv3d(ch, ch * 2, kernel_size=(3, 3, 3), padding=1, bias=False),
             nn.LeakyReLU(negative_slope=0.05, inplace=True),
-            nn.Conv3d(ch * 2, ch, kernel_size=(3, 3, 3), padding=1),
+            nn.Conv3d(ch * 2, ch, kernel_size=(3, 3, 3), padding=1, bias=False),
         )
 
         self.up_blocks = nn.ModuleList()
@@ -256,7 +250,7 @@ class Unet3D(torch.nn.Module):
         self.up_blocks.append(UpConvBlock(2 * ch, ch, self.drop_prob))
 
         self.final_conv = nn.Conv3d(
-            ch, self.out_chans, kernel_size=(1, 1, 1), stride=(1, 1, 1)
+            ch, self.out_chans, kernel_size=(1, 1, 1), stride=(1, 1, 1), bias=False
         )
 
     def normalize(self, volume: torch.Tensor) -> torch.Tensor:
@@ -301,16 +295,13 @@ class DownConvBlock(nn.Module):
         self.drop_prob = drop_prob
 
         self.layers = nn.Sequential(
-            nn.Conv3d(in_chans, out_chans, kernel_size=(3, 3, 3), padding=1),
-            nn.InstanceNorm3d(out_chans),
+            nn.Conv3d(in_chans, out_chans, kernel_size=(3, 3, 3), padding=1, bias=False),
             nn.Dropout3d(drop_prob),
             nn.LeakyReLU(negative_slope=0.05, inplace=True),
-            nn.Conv3d(out_chans, out_chans, kernel_size=(3, 3, 3), padding=1),
-            nn.InstanceNorm3d(out_chans),
+            nn.Conv3d(out_chans, out_chans, kernel_size=(3, 3, 3), padding=1, bias=False),
             nn.Dropout3d(drop_prob),
             nn.LeakyReLU(negative_slope=0.05, inplace=True),
-            nn.Conv3d(out_chans, out_chans, kernel_size=(3, 3, 3), padding=1),
-            nn.InstanceNorm3d(out_chans),
+            nn.Conv3d(out_chans, out_chans, kernel_size=(3, 3, 3), padding=1, bias=False),
             nn.Dropout3d(drop_prob),
             nn.LeakyReLU(negative_slope=0.05, inplace=True),
         )
@@ -328,16 +319,13 @@ class UpConvBlock(nn.Module):
         self.drop_prob = drop_prob
 
         self.layers = nn.Sequential(
-            nn.Conv3d(in_chans, in_chans // 2, kernel_size=(3, 3, 3), padding=1),
-            nn.InstanceNorm3d(in_chans // 2),
+            nn.Conv3d(in_chans, in_chans // 2, kernel_size=(3, 3, 3), padding=1, bias=False),
             nn.Dropout3d(drop_prob),
             nn.LeakyReLU(negative_slope=0.05, inplace=True),
-            nn.Conv3d(in_chans // 2, in_chans // 2, kernel_size=(3, 3, 3), padding=1),
-            nn.InstanceNorm3d(in_chans // 2),
+            nn.Conv3d(in_chans // 2, in_chans // 2, kernel_size=(3, 3, 3), padding=1, bias=False),
             nn.Dropout3d(drop_prob),
             nn.LeakyReLU(negative_slope=0.05, inplace=True),
-            nn.Conv3d(in_chans // 2, out_chans, kernel_size=(3, 3, 3), padding=1),
-            nn.InstanceNorm3d(out_chans),
+            nn.Conv3d(in_chans // 2, out_chans, kernel_size=(3, 3, 3), padding=1, bias=False),
             nn.Dropout3d(drop_prob),
             nn.LeakyReLU(negative_slope=0.05, inplace=True),
         )
@@ -350,7 +338,7 @@ class SpatialDownSampling(nn.Module):
     def __init__(self, chans: int) -> None:
         super().__init__()
         self.layers = nn.Sequential(
-            nn.Conv3d(chans, chans, kernel_size=(3, 3, 3), stride=(2, 2, 2), padding=1),
+            nn.Conv3d(chans, chans, kernel_size=(3, 3, 3), stride=(2, 2, 2), padding=1, bias=False),
             nn.LeakyReLU(negative_slope=0.05, inplace=True),
         )
 
@@ -361,18 +349,20 @@ class SpatialDownSampling(nn.Module):
 class SpatialUpSampling(nn.Module):
     def __init__(self, in_chans: int, out_chans: int, drop_prob=0.0):
         super().__init__()
-        self.tconv = nn.ConvTranspose3d(
-            in_chans,
-            out_chans,
-            kernel_size=(3, 3, 3),
-            stride=(2, 2, 2),
-            padding=1,
-            output_padding=1,
+        # Nearest-neighbor upsampling followed by a stride-1 conv, instead of a
+        # strided ConvTranspose3d: with kernel_size=3 not divisible by stride=2, the
+        # transposed conv gives uneven kernel overlap across output voxels, a
+        # deterministic period-2 "checkerboard" artifact (see Odena et al., "Deconvolution
+        # and Checkerboard Artifacts"). Resize+conv has no stride mismatch to produce
+        # that unevenness.
+        self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
+        self.conv = nn.Conv3d(
+            in_chans, out_chans, kernel_size=(3, 3, 3), stride=(1, 1, 1), padding=1, bias=False
         )
         self.activation = nn.LeakyReLU(negative_slope=0.05, inplace=True)
 
     def forward(self, volume: torch.Tensor, cat: torch.Tensor) -> torch.Tensor:
-        output = self.tconv(volume)
+        output = self.conv(self.upsample(volume))
         output = torch.cat([output, cat], dim=1)
         output = self.activation(output)
         return output

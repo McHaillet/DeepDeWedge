@@ -45,9 +45,6 @@ def fit_model(
     subtomo_size: Annotated[
         int, typer.Option(help="Size of the cubic subtomograms used for model fitting.")
     ],
-    mw_angle: Annotated[
-        float, typer.Option(help="Width of the missing wedge in degrees.")
-    ],
     gpu: Annotated[List[int], typer.Option(help="Which GPU(s) to use for model fitting. Example: gpu=0 uses the first GPU, gpu=[0,1] uses the first two GPUs.")],
     num_workers: Annotated[
         int,
@@ -73,6 +70,13 @@ def fit_model(
             help="Path to the directory where the model checkpoints and logs will be saved. If logdir is not provided, logdir is set to '{project_dir}/logs'."
         ),
     ] = None,
+    lambda_: Annotated[
+        float,
+        typer.Option(
+            "--lambda",
+            help="Weight of the equivariance loss term relative to the data-consistency loss term: total loss = data_consistency_loss + lambda * equivariance_loss."
+        ),
+    ] = 2.0,
     logger: Annotated[
         str,
         typer.Option(
@@ -81,12 +85,6 @@ def fit_model(
     ] = "tensorboard",
     check_val_every_n_epochs: Annotated[
         int, typer.Option(help="Check validation loss every n epochs.")
-    ] = 10,
-    update_subtomo_missing_wedges_every_n_epochs: Annotated[
-        int,
-        typer.Option(
-            help="After how many epochs to update the missing wedge in the subtomograms."
-        ),
     ] = 10,
     save_model_every_n_epochs: Annotated[
         int, typer.Option(help="Save a model checkpoint to logdir every n epochs.")
@@ -132,6 +130,11 @@ def fit_model(
             raise ValueError(
                 "If project_dir is not provided, subtomo_dir must be provided."
             )
+    if not os.path.exists(f"{subtomo_dir}/fitting_subtomos/ctf"):
+        raise ValueError(
+            f"'{subtomo_dir}/fitting_subtomos' must contain a 'ctf' subdirectory "
+            "(see SubtomoDataset for the expected directory layout)."
+        )
     # setup logdir
     if logdir is None:
         if project_dir is not None:
@@ -163,27 +166,33 @@ def fit_model(
             "Running model fitting without validation, as no validation data was found!"
         )
 
-    if not subtomo_size % (2 ** unet_params_dict["num_downsample_layers"]) == 0:
+    factor = 2 ** unet_params_dict["num_downsample_layers"]
+    if not subtomo_size % factor == 0:
         raise ValueError(
             f"subtomo_size must be divisible by 2^unet_params_dict['num_downsample_layers'] to ensure compatibility with the U-Net architecture. "
             f"Got subtomo_size={subtomo_size} and num_downsample_layers={unet_params_dict['num_downsample_layers']}."
         )
 
     # setup datasets
-    fitting_dataset = SubtomoDataset(
-        subtomo_dir=f"{subtomo_dir}/fitting_subtomos",
-        crop_subtomos_to_size=subtomo_size,
-        mw_angle=mw_angle,
-        rotate_subtomos=True,
-        deterministic_rotations=False,
-    )
+    fitting_dataset = SubtomoDataset(subtomo_dir=f"{subtomo_dir}/fitting_subtomos")
     if val_data_exists:
-        val_dataset = SubtomoDataset(
-            subtomo_dir=f"{subtomo_dir}/val_subtomos",
-            crop_subtomos_to_size=subtomo_size,
-            mw_angle=mw_angle,
-            rotate_subtomos=True,
-            deterministic_rotations=True,
+        val_dataset = SubtomoDataset(subtomo_dir=f"{subtomo_dir}/val_subtomos")
+
+    # the model is run directly on the on-disk subtomo0/subtomo1 every step (see
+    # LitUnet3D._step), rotating its own estimate in place with one of the 20 grid-aligned
+    # rotations from ddw.utils.rotation.get_grid_rotations - exact (no interpolation) and
+    # shape-preserving, so the on-disk size must simply equal subtomo_size
+    native_size = fitting_dataset[0]["subtomo0"].shape[-1]
+    if native_size % factor != 0:
+        raise ValueError(
+            f"The on-disk sub-tomogram size ({native_size}) must be divisible by "
+            f"2**num_downsample_layers ({factor}) to ensure compatibility with the "
+            "U-Net architecture. Extract your sub-tomograms at a compatible size."
+        )
+    if native_size != subtomo_size:
+        raise ValueError(
+            f"The on-disk sub-tomogram size ({native_size}) must be equal to "
+            f"subtomo_size ({subtomo_size})."
         )
     # setup callbacks
     callbacks = []
@@ -225,8 +234,8 @@ def fit_model(
     lit_unet = LitUnet3D(
         unet_params=unet_params_dict,
         adam_params=adam_params_dict,
-        subtomo_dir=subtomo_dir,
-        update_subtomo_missing_wedges_every_n_epochs=update_subtomo_missing_wedges_every_n_epochs,
+        subtomo_size=subtomo_size,
+        lambda_=lambda_,
     )
     # initialize the trainer
     devices = [gpu] if isinstance(gpu, int) else gpu
@@ -256,6 +265,7 @@ def fit_model(
         num_workers=num_workers,
         persistent_workers=True,
         pin_memory=True,
+        shuffle=True,
     )
     if val_data_exists:
         val_dataloader = DataLoader(

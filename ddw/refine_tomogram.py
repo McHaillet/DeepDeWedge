@@ -12,10 +12,8 @@ from typer_config import conf_callback_factory
 from typing_extensions import Annotated
 
 from .fit_model import LitUnet3D
-from .utils.fourier import apply_fourier_mask_to_tomo
 from .utils.load_function_args_from_yaml_config import \
     load_function_args_from_yaml_config
-from .utils.missing_wedge import get_missing_wedge_mask
 from .utils.mrctools import load_mrc_data, save_mrc_data
 from .utils.normalization import get_avg_model_input_mean_and_std
 from .utils.subtomos import extract_subtomos, reassemble_subtomos
@@ -50,9 +48,6 @@ def refine_tomogram(
         typer.Option(
             help="Size of the cubic subtomograms to extract. This should be the same as the subtomo_size used during model fitting."
         ),
-    ],
-    mw_angle: Annotated[
-        int, typer.Option(help="Width of the missing wedge in degrees.")
     ],
     subtomo_overlap: Annotated[
         Optional[int],
@@ -154,7 +149,6 @@ def refine_tomogram(
                     tomo_file=t0_file,
                     subtomo_size=subtomo_size,
                     subtomo_extraction_strides=3 * [subtomo_size - subtomo_overlap],
-                    mw_angle=mw_angle,
                     batch_size=batch_size,
                     standardize=standardize_full_tomos,
                     num_workers=num_workers,
@@ -171,7 +165,6 @@ def refine_tomogram(
                 lightning_model=lightning_model,
                 subtomo_size=subtomo_size,
                 subtomo_overlap=subtomo_overlap,
-                mw_angle=mw_angle,
                 normalization_loc=loc,
                 normalization_scale=scale,
                 num_workers=num_workers,
@@ -183,7 +176,6 @@ def refine_tomogram(
                 lightning_model=lightning_model,
                 subtomo_size=subtomo_size,
                 subtomo_overlap=subtomo_overlap,
-                mw_angle=mw_angle,
                 normalization_loc=loc,
                 normalization_scale=scale,
                 num_workers=num_workers,
@@ -209,7 +201,6 @@ def _refine_single_tomogram(
     lightning_model,
     subtomo_size,
     subtomo_overlap,
-    mw_angle,
     normalization_loc,
     normalization_scale,
     num_workers=0,
@@ -218,9 +209,9 @@ def _refine_single_tomogram(
 ):
 
     tomo = load_mrc_data(tomo_file).float()#.to(lightning_model.device)
-    # apply missing wedge mask here to be more consistent with data during model fitting
-    mw_mask = get_missing_wedge_mask(tomo.shape, mw_angle, device=tomo.device)
-    tomo = apply_fourier_mask_to_tomo(tomo, mw_mask)
+    # tomo is already missing-wedge-degraded from acquisition/reconstruction, so no
+    # masking is applied here (see c04a4d8: masking it again is a genuine
+    # double-application, harmless only for the legacy binary wedge)
 
     tomo = (tomo / tomo.std()) * torch.tensor(normalization_scale).to(tomo.device)
     tomo = tomo - tomo.mean() + torch.tensor(normalization_loc).to(tomo.device)
@@ -229,7 +220,6 @@ def _refine_single_tomogram(
         tomo=tomo.cpu(),
         subtomo_size=subtomo_size,
         subtomo_extraction_strides=3 * [subtomo_size - subtomo_overlap],
-        enlarge_subtomos_for_rotating=False,
         pad_before_subtomo_extraction=True,
     )
     

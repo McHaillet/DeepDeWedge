@@ -1,16 +1,9 @@
+import glob
 import os
 
 import time
 import torch
-from scipy import spatial
 from torch.utils.data import Dataset
-
-from .fourier import apply_fourier_mask_to_tomo
-from .missing_wedge import (get_missing_wedge_mask,
-                            get_rotated_missing_wedge_mask)
-from .rotation import rotate_vol_around_axis
-
-BASE_SEED = 888
 
 
 def safe_load(file_path, max_retries=3, delay=1):
@@ -27,104 +20,59 @@ def safe_load(file_path, max_retries=3, delay=1):
             time.sleep(delay)  # Wait before retrying
 
 
-
 class SubtomoDataset(Dataset):
     """
-    A torch dataset which produces the input-target sub-tomogram pairs used for model fitting. The directory 'subtomo_dir' must have the same structure as the output of the 'ddw prepare-data' command.
+    A torch dataset producing raw (subtomo0, subtomo1, ctf) triples used for model fitting.
+    'subtomo_dir' must have 'subtomo0/', 'subtomo1/' and 'ctf/' subdirectories, each holding
+    matching '{index}.pt' files.
+
+    'subtomo0'/'subtomo1' are two independent-noise reconstructions of the same tomogram
+    region (e.g. from even/odd tilt series frames), at 'subtomo_size' - the model is run on
+    them directly, with no cropping: LitUnet3D rotates its own estimate using one of the 20
+    grid-aligned rotations from ddw.utils.rotation.get_grid_rotations, which is exact (no
+    interpolation) and preserves shape, so no extra border is needed to rotate into. Both
+    share the same physical 'ctf' (values in [0, 1]), since it depends only on the
+    acquisition geometry, not on which half of the frames was used.
+
+    'ctf/{index}.pt' must be given at the same 'subtomo_size' as subtomo0/subtomo1: a CTF,
+    unlike a binary missing-wedge mask, has genuine radial/magnitude frequency dependence and
+    can't be correctly resized in Fourier space, so it must be independently, correctly
+    reconstructed at that resolution. Each tensor must be real-valued, in rfftn convention:
+    shape (N, N, N//2+1), DC at index [0,0,0] (unshifted) - matching what
+    apply_fourier_mask_to_tomo expects. Unlike a real-space volume, this mask is never
+    rotated anywhere in this codebase, so there is no need to convert it to a full,
+    fftshifted (N, N, N) array (see apply_fourier_mask_to_tomo).
     """
 
-    def __init__(
-        self,
-        subtomo_dir,
-        mw_angle,
-        crop_subtomos_to_size,
-        rotate_subtomos=True,
-        deterministic_rotations=False,
-    ):
+    def __init__(self, subtomo_dir):
         super().__init__()
         self.subtomo_dir = subtomo_dir
-        self.crop_subtomos_to_size = crop_subtomos_to_size
-        self.mw_angle = mw_angle
-        self.rotate_subtomos = rotate_subtomos
-        self.deterministic_rotations = deterministic_rotations
-
-    @property
-    def rotate_subtomos(self):
-        return self._rotate_subtomos
-
-    @rotate_subtomos.setter
-    def rotate_subtomos(self, rotate_subtomos):
-        if not isinstance(rotate_subtomos, bool):
-            raise ValueError("rotate_subtomos must be a boolean")
-        self._rotate_subtomos = rotate_subtomos
-
-    def _sample_rot_axis_and_angle(self, index):
-        seed = BASE_SEED + index if self.deterministic_rotations else None
-        rotvec = torch.from_numpy(
-            spatial.transform.Rotation.random(random_state=seed).as_rotvec()
-        )
-        rot_axis = rotvec / rotvec.norm()
-        rot_angle = torch.rad2deg(rotvec.norm())
-        return rot_axis, rot_angle
+        for sub in ["subtomo0", "subtomo1", "ctf"]:
+            if not os.path.isdir(f"{subtomo_dir}/{sub}"):
+                raise ValueError(f"'{subtomo_dir}' must contain a '{sub}' subdirectory.")
 
     def __len__(self):
-        return len(os.listdir(f"{self.subtomo_dir}/subtomo0"))
+        # count only "*.pt" files, not every directory entry: a stray non-'.pt' file (a
+        # hidden dotfile, an NFS silly-rename artifact from a deleted-while-open file, a
+        # leftover from an interrupted run, ...) would otherwise inflate the count past the
+        # number of actual, contiguously-indexed samples, causing __getitem__ to be asked
+        # for an index one-past-the-end that doesn't exist on disk
+        return len(glob.glob(f"{self.subtomo_dir}/subtomo0/*.pt"))
 
     def __getitem__(self, index):
-        # load subtomos
         subtomo0_file = f"{self.subtomo_dir}/subtomo0/{index}.pt"
-        subtomo0 = safe_load(subtomo0_file)
         subtomo1_file = f"{self.subtomo_dir}/subtomo1/{index}.pt"
+        subtomo0 = safe_load(subtomo0_file)
         subtomo1 = safe_load(subtomo1_file)
-        # rotate subtomos
-        if self.rotate_subtomos == True:
-            rot_axis, rot_angle = self._sample_rot_axis_and_angle(index)
-            subtomo0 = rotate_vol_around_axis(
-                subtomo0,
-                rot_angle=rot_angle,
-                rot_axis=rot_axis,
-                output_shape=3 * [self.crop_subtomos_to_size],
-            )
-            subtomo1 = rotate_vol_around_axis(
-                subtomo1,
-                rot_angle=rot_angle,
-                rot_axis=rot_axis,
-                output_shape=3 * [self.crop_subtomos_to_size],
-            )
-            # add missing wedge
-            mw_mask = get_missing_wedge_mask(
-                grid_size=3 * [self.crop_subtomos_to_size],
-                mw_angle=self.mw_angle,
-                device=subtomo0.device,
-            )
-            rot_mw_mask = get_rotated_missing_wedge_mask(
-                grid_size=3 * [self.crop_subtomos_to_size],
-                mw_angle=self.mw_angle,
-                rot_axis=rot_axis,
-                rot_angle=rot_angle,
-                device=subtomo0.device,
-            )
-        else:
-            mw_mask = get_missing_wedge_mask(
-                grid_size=subtomo0.shape,
-                mw_angle=self.mw_angle,
-                device=subtomo0.device,
-            )
-            rot_mw_mask = mw_mask
-            rot_angle, rot_axis = 0, torch.tensor([1.0, 0.0, 0.0])
-
-        model_input = apply_fourier_mask_to_tomo(subtomo0, mw_mask)
-        item = {
-            "model_input": model_input,
-            "model_target": subtomo1,
-            "mw_mask": mw_mask,
-            "rot_mw_mask": rot_mw_mask,
+        ctf = safe_load(f"{self.subtomo_dir}/ctf/{index}.pt")
+        return {
+            "subtomo0": subtomo0,
+            "subtomo1": subtomo1,
+            "ctf": ctf,
             "subtomo0_file": subtomo0_file,
             "subtomo1_file": subtomo1_file,
-            "rot_angle": rot_angle,
-            "rot_axis": rot_axis,
+            "index": index,
         }
-        return item
 
 
 # %%

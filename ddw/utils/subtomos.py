@@ -1,5 +1,3 @@
-import math
-
 import numpy as np
 import torch
 
@@ -8,16 +6,12 @@ def extract_subtomos(
     tomo,
     subtomo_size,
     subtomo_extraction_strides=None,
-    enlarge_subtomos_for_rotating=False,
     pad_before_subtomo_extraction=False,
 ):
     """
     Extracts sub-tomograms of size 'subtomo_size' using a 3D sliding window approach. The three strides of the sliding window are specified by 'subtomo_extraction_strides', which must be three integers.
-    If 'enlarge_subtomos_for_rotating' is True, sub-tomograms are extracted with shape sqrt(2)*'subtomo_size, so they can be rotated and cropped to 'subtomo_size' without zero-filling.
     """
     # TODO: refactor subtomo_extraction_strides to subtomo_overlap
-    if enlarge_subtomos_for_rotating:
-        subtomo_size = ceil_to_even_integer(math.sqrt(2) * subtomo_size)
     if subtomo_extraction_strides is None:
         subtomo_extraction_strides = 3 * [subtomo_size]
     if pad_before_subtomo_extraction:
@@ -62,6 +56,8 @@ def reassemble_subtomos(
 ):
     """
     Basically the inverse of 'extract_subtomos'. For this to work, 'extract_subtomos' must have been called with 'pad_before_subtomo_extraction=True', and 'crop_to_size' must be set to the 3D shape of the tomogram from which the sub-tomograms were extracted.
+
+    'subtomo_overlap' is the number of voxels neighboring sub-tomograms actually overlap by, used to size the linear blending ramp at each box edge (see 'get_linear_ramp_weights'); it must match the real grid spacing, not just a nominal target, or the ramp covers only part of the true overlap and leaves a visible seam at every grid line. Pass a single int to use the same width on all three axes, or a (width_0, width_1, width_2) tuple/list if the overlap differs per axis. None disables blending (plain average of overlapping regions).
     """
     # calculate the max indices in each dimension to infer the shape of the original tomogram
     subtomo_size = subtomos[0].shape[0]
@@ -101,32 +97,75 @@ def reassemble_subtomos(
     return out_vol
 
 
+def reassemble_subtomos_nearest_center(subtomos, subtomo_start_coords, crop_to_size=None):
+    """
+    Alternative to 'reassemble_subtomos' for combining overlapping sub-tomograms: instead of
+    blending overlapping regions with ramp weights, each output voxel takes its value from
+    whichever covering sub-tomogram's own center is closest (nearest-center / Voronoi
+    assignment - no averaging, exactly one sub-tomogram contributes to each voxel).
+
+    Useful when each sub-tomogram is itself less reliable near its own edges/corners (e.g. a
+    reconstruction artifact that grows with distance from the sub-tomogram's center): blending
+    several such edge-degraded samples together doesn't cancel the degradation the way it
+    would for independent noise, it just compounds it, so picking the single least-degraded
+    sample per voxel is more faithful than a weighted average.
+    """
+    subtomo_size = subtomos[0].shape[0]
+    max_idx = [
+        max(start_idx[i] + subtomo_size for start_idx in subtomo_start_coords)
+        for i in range(3)
+    ]
+    # squared distance of every voxel in a sub-tomogram to its own center - identical for
+    # every sub-tomogram (same size), so build it once
+    center = (subtomo_size - 1) / 2.0
+    offset = torch.arange(subtomo_size, dtype=torch.float32, device=subtomos[0].device) - center
+    dist2 = offset[:, None, None] ** 2 + offset[None, :, None] ** 2 + offset[None, None, :] ** 2
+
+    out_vol = torch.zeros(max_idx, dtype=torch.float32, device=subtomos[0].device)
+    best_dist2 = torch.full(max_idx, float("inf"), dtype=torch.float32, device=subtomos[0].device)
+    for subtomo, start_idx in zip(subtomos, subtomo_start_coords):
+        end_idx = [start + subtomo_size for start in start_idx]
+        region = (
+            slice(start_idx[0], end_idx[0]),
+            slice(start_idx[1], end_idx[1]),
+            slice(start_idx[2], end_idx[2]),
+        )
+        closer = dist2 < best_dist2[region]
+        out_vol[region] = torch.where(closer, subtomo, out_vol[region])
+        best_dist2[region] = torch.where(closer, dist2, best_dist2[region])
+
+    if crop_to_size is not None:
+        out_vol = out_vol[: crop_to_size[0], : crop_to_size[1], : crop_to_size[2]]
+    return out_vol
+
+
 def get_linear_ramp_weights(subtomo_size, subtomo_overlap):
     """
-    Produces a cubic 3D tensor containing linear weights used to average overlapping sub-tomogram parts in 'reassemble_subtomos'.
+    Produces a cubic 3D tensor containing linear weights used to average overlapping sub-tomogram parts in 'reassemble_subtomos'. 'subtomo_overlap' is a single int (same ramp width on all three axes) or a 3-tuple/list of per-axis ramp widths, axis order matching the subtomo tensor's own axes; a width of 0 disables ramping on that axis (weight 1 everywhere along it).
     """
-    ramp = np.linspace(0, 1, subtomo_overlap) + 1e-6
-    weight_map_1d = np.ones(subtomo_size)
-    weight_map_1d[:subtomo_overlap] = ramp  # Apply sigmoid ramp at the start
-    weight_map_1d[-subtomo_overlap:] = ramp[::-1]  # and at the end, inverted
+    if isinstance(subtomo_overlap, (int, np.integer)):
+        subtomo_overlap = 3 * [subtomo_overlap]
 
-    # Create a 3D weight map by extending the 1D weight map to 3 dimensions
-    weight_map_3d = np.ones((subtomo_size, subtomo_size, subtomo_size))
-    for i in range(subtomo_size):
-        for j in range(subtomo_size):
-            for k in range(subtomo_size):
-                weight_map_3d[i, j, k] = (
-                    weight_map_1d[i] * weight_map_1d[j] * weight_map_1d[k]
-                )
+    weight_maps_1d = []
+    for overlap in subtomo_overlap:
+        # cap at size // 2: wider than that, the head and tail ramp slices below
+        # overlap and the second overwrites part of the first, producing a
+        # non-monotonic double-peak instead of a smooth taper
+        overlap = min(overlap, subtomo_size // 2)
+        weight_map_1d = np.ones(subtomo_size)
+        if overlap > 0:
+            ramp = np.linspace(0, 1, overlap) + 1e-6
+            weight_map_1d[:overlap] = ramp  # ramp up at the start
+            weight_map_1d[-overlap:] = ramp[::-1]  # and down at the end
+        weight_maps_1d.append(weight_map_1d)
 
+    # outer product of the three 1D weight maps into one 3D weight map
+    weight_map_3d = (
+        weight_maps_1d[0][:, None, None]
+        * weight_maps_1d[1][None, :, None]
+        * weight_maps_1d[2][None, None, :]
+    )
     return torch.from_numpy(weight_map_3d)
-
-
-def ceil_to_even_integer(x):
-    """
-    Produces the smallest even integer i that satisfies i >= x.
-    """
-    return int(math.ceil(x / 2.0) * 2)
 
 
 # def try_to_sample_non_overlapping_subtomo_ids(
