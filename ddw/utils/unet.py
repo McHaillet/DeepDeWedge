@@ -66,20 +66,28 @@ class LitUnet3D(pl.LightningModule):
         subtomo1 = batch["subtomo1"]
         ctf = batch["ctf"]
 
-        x_hat0 = self(subtomo0)
-        x_hat1 = self(subtomo1)
-
-        dc_loss = data_consistency_loss(x_hat0, x_hat1, subtomo0, subtomo1, ctf)
-
         # alternate which estimate is rotated + re-degraded to build the equivariance term's
         # model input ("x_hat2") vs. which (the *other*, independent-noise) estimate serves as
         # its target ("x_hat1"), bounding compute to 3 (rather than 4) forward passes of the
-        # model
+        # model. The same choice also picks which of the two cross-wise data-consistency
+        # pairings dc_loss evaluates this step (rather than always summing both): only the
+        # "source" branch needs gradients for that, so the "target" branch - only ever used
+        # detached, both here and for the equivariance loss below - is computed under
+        # torch.no_grad() to skip unneeded gradient bookkeeping and speed things up slightly.
         use_branch0_as_source = (
             (batch_idx % 2 == 0) if deterministic else (random.random() < 0.5)
         )
-        x_hat_source = x_hat0 if use_branch0_as_source else x_hat1
-        x_hat_target = x_hat1 if use_branch0_as_source else x_hat0
+        if use_branch0_as_source:
+            x_hat_source = self(subtomo0)
+            with torch.no_grad():
+                x_hat_target = self(subtomo1)
+        else:
+            x_hat_source = self(subtomo1)
+            with torch.no_grad():
+                x_hat_target = self(subtomo0)
+
+        y_cross = subtomo1 if use_branch0_as_source else subtomo0
+        dc_loss = data_consistency_loss(x_hat_source, y_cross, ctf)
 
         # sampled once and reused for both the forward and inverse rotation below, so they
         # are guaranteed to exactly cancel (see _sample_rotations)

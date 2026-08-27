@@ -3,23 +3,26 @@ import torch
 from .fourier import apply_fourier_mask_to_tomo
 
 
-def data_consistency_loss(x_hat0, x_hat1, y0, y1, ctf):
+def data_consistency_loss(x_hat, y, ctf):
     """
-    Noise2Noise-style data-consistency loss. 'x_hat0'/'x_hat1' are the model's estimates
-    from the two independent-noise raw observations 'y0'/'y1' (which already carry the same
-    physical 'ctf' baked in from acquisition/reconstruction - it is never re-applied to them).
-    Each estimate is re-masked with the canonical (native-orientation) 'ctf' and compared
-    against the *other*, cross-wise, raw observation - not the one it came from, which would
-    let the model trivially learn identity without ever averaging out noise.
+    Noise2Noise-style data-consistency loss, for one estimate/observation pair. 'x_hat' is
+    the model's estimate from one of the two independent-noise raw observations; 'y' is the
+    *other* one (which already carries the same physical 'ctf' baked in from acquisition/
+    reconstruction - it is never re-applied to it). 'x_hat' is re-masked with the canonical
+    (native-orientation) 'ctf' and compared against 'y' - the caller is responsible for this
+    cross-wise pairing (passing the observation 'x_hat' did *not* come from), since comparing
+    an estimate to the observation it came from would let the model trivially learn identity
+    without ever averaging out noise.
 
-    Because 'y0' and 'y1' share the exact same physical 'ctf', frequencies where 'ctf' is
-    near zero contribute ~0 to both sides automatically (both the re-masked estimate and the
-    raw target are ~0 there) - unlike the old two-region masked_loss, no extra region
-    weighting is needed to handle this, which matters for a continuous (non-binary) CTF.
+    Because both raw observations share the exact same physical 'ctf', frequencies where
+    'ctf' is near zero contribute ~0 automatically (both the re-masked estimate and the raw
+    target are ~0 there) - unlike the old two-region masked_loss, no extra region weighting
+    is needed to handle this, which matters for a continuous (non-binary) CTF.
+
+    LitUnet3D._step calls this once per step, with the (x_hat, y) pair picked at random
+    between the two possible cross-wise pairings - see its docstring/comments for why.
     """
-    term0 = apply_fourier_mask_to_tomo(x_hat0, ctf) - y1
-    term1 = apply_fourier_mask_to_tomo(x_hat1, ctf) - y0
-    return term0.pow(2).mean() + term1.pow(2).mean()
+    return (apply_fourier_mask_to_tomo(x_hat, ctf) - y).pow(2).mean()
 
 
 def equivariance_loss(x_double_hat, target, mask, norm="ortho"):
