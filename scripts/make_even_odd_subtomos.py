@@ -51,6 +51,7 @@ from pathlib import Path
 import torch
 
 from warpylib import TiltSeries
+from warpylib.ops import preprocess_tilt_data
 
 
 def make_grid_positions(volume_dims: torch.Tensor, box_physical: float, overlap: float) -> torch.Tensor:
@@ -154,6 +155,12 @@ def main() -> None:
         )
         images_odd = images_odd.to(device)
         images_even = images_even.to(device)
+
+        # Plane-subtraction + bandpass + normalization per tilt image, same preprocessing
+        # warpylib's own reconstruct_full applies before backprojection.
+        preprocess_size = args.box_size * args.oversampling
+        images_odd = preprocess_tilt_data(images_odd, normalize=True, invert=False, subvolume_size=preprocess_size)
+        images_even = preprocess_tilt_data(images_even, normalize=True, invert=False, subvolume_size=preprocess_size)
 
         even_vols = batched_reconstruct(
             lambda p: ts.reconstruct_subvolumes_single(images_even, p, pixel_size=args.pixel_size, size=args.box_size, oversampling=args.oversampling, apply_ctf=True, correct_attenuation=True),
