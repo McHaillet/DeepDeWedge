@@ -1,0 +1,2 @@
+- get rid of tiling pattern
+- test on 96 cubed boxes
