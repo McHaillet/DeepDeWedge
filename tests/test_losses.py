@@ -5,7 +5,11 @@ no GPU needed.
 import torch
 
 from ddw.utils.fourier import apply_fourier_mask_to_tomo
-from ddw.utils.losses import data_consistency_loss, equivariance_loss
+from ddw.utils.losses import (
+    cross_consistency_loss,
+    data_consistency_loss,
+    equivariance_loss,
+)
 
 
 def test_data_consistency_loss_zero_for_perfect_cross_reconstruction():
@@ -97,6 +101,60 @@ def test_equivariance_loss_ignores_zero_mask_frequencies():
     delta = torch.fft.irfftn(delta_freq, s=(N, N, N), norm="ortho")
     loss_ab_perturbed = equivariance_loss(a + delta, b, mask)
     assert torch.allclose(loss_ab, loss_ab_perturbed, atol=1e-4)
+
+
+def test_cross_consistency_loss_zero_when_identical():
+    torch.manual_seed(0)
+    ctf = torch.rand(6, 6, 4).clamp(0, 1)
+    x = torch.randn(4, 6, 6, 6)
+    assert cross_consistency_loss(x, x, ctf).item() == 0.0
+
+
+def test_cross_consistency_loss_matches_manual_weighted_power_spectrum():
+    torch.manual_seed(0)
+    N = 8
+    ctf = torch.rand(N, N, N // 2 + 1).clamp(0, 1)
+    x0_hat = torch.randn(4, N, N, N)
+    x1_hat = torch.randn(4, N, N, N)
+    diff_ft = torch.fft.rfftn(x0_hat - x1_hat, dim=(-3, -2, -1), norm="ortho")
+    expected = ((1 - ctf**2) * diff_ft.abs().pow(2)).mean()
+    assert torch.allclose(cross_consistency_loss(x0_hat, x1_hat, ctf), expected)
+
+
+def test_cross_consistency_loss_ignores_frequencies_where_ctf_is_one():
+    """
+    Where 'ctf' is exactly 1, the (1-ctf^2) weight is exactly 0, so disagreement between
+    x0_hat and x1_hat there must not affect the loss - dc_loss already fully constrains that
+    frequency, so this term shouldn't also compete there.
+    """
+    torch.manual_seed(0)
+    N = 8
+    ctf = torch.zeros(N, N, N // 2 + 1)
+    ctf[:, :, : N // 4] = 1.0  # fully trusted band
+
+    x0_hat = torch.randn(N, N, N)
+    x1_hat = torch.randn(N, N, N)
+    loss_a = cross_consistency_loss(x0_hat, x1_hat, ctf)
+
+    delta_freq = torch.fft.rfftn(torch.randn(N, N, N), norm="ortho") * ctf
+    delta = torch.fft.irfftn(delta_freq, s=(N, N, N), norm="ortho")
+    loss_b = cross_consistency_loss(x0_hat + delta, x1_hat, ctf)
+    assert torch.allclose(loss_a, loss_b, atol=1e-4)
+
+
+def test_cross_consistency_loss_fully_active_where_ctf_is_zero():
+    """
+    Where 'ctf' is exactly 0, the (1-ctf^2) weight is exactly 1 - dc_loss gives that
+    frequency ~no constraint, so this term should apply full weight there.
+    """
+    torch.manual_seed(0)
+    N = 8
+    ctf = torch.zeros(N, N, N // 2 + 1)
+    x0_hat = torch.randn(N, N, N)
+    x1_hat = torch.randn(N, N, N)
+    diff_ft = torch.fft.rfftn(x0_hat - x1_hat, dim=(-3, -2, -1), norm="ortho")
+    expected = diff_ft.abs().pow(2).mean()
+    assert torch.allclose(cross_consistency_loss(x0_hat, x1_hat, ctf), expected)
 
 
 def test_equivariance_loss_scale_matches_real_space_mse():

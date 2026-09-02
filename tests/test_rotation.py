@@ -8,9 +8,12 @@ import torch
 
 from ddw.utils.rotation import (
     GRID_ROTATIONS,
+    WEDGE_PRESERVING_FLIPS,
     get_grid_rotations,
+    get_wedge_preserving_flips,
     rotate_vol,
     sample_grid_rotation,
+    sample_wedge_preserving_flip,
 )
 
 
@@ -138,3 +141,56 @@ def test_sample_grid_rotation_returns_one_of_the_20():
     for index in range(20):
         mat = sample_grid_rotation(index, deterministic=True)
         assert tuple(mat.flatten().tolist()) in grid_set
+
+
+def test_get_wedge_preserving_flips_are_the_3_missing_from_grid_rotations():
+    """
+    get_grid_rotations excludes exactly 4 of the 24 proper rotations (the ones that leave the
+    missing-wedge/CTF direction unchanged); get_wedge_preserving_flips should return the
+    non-identity 3 of those 4 (identity is a no-op, of no use as a "mirror" augmentation).
+    """
+    all_24 = {tuple(m.flatten().tolist()) for m in _all_signed_permutation_rotations()}
+    grid_20 = {tuple(m.flatten().tolist()) for m in get_grid_rotations()}
+    excluded_4 = all_24 - grid_20
+    identity = tuple(torch.eye(3, dtype=torch.int64).flatten().tolist())
+    assert excluded_4 - {identity} == {
+        tuple(m.flatten().tolist()) for m in get_wedge_preserving_flips()
+    }
+
+
+def test_wedge_preserving_flips_are_diagonal_with_two_axes_flipped():
+    for mat in WEDGE_PRESERVING_FLIPS:
+        assert torch.equal(mat, torch.diag(torch.diagonal(mat)))  # diagonal, no permutation
+        assert round(torch.linalg.det(mat.float()).item()) == 1
+        assert (torch.diagonal(mat) == -1).sum().item() == 2
+
+
+def test_wedge_preserving_flips_are_involutions():
+    # each flips two axes together (each ±1 squared is 1), so applying one twice is identity
+    for mat in WEDGE_PRESERVING_FLIPS:
+        assert torch.equal(mat @ mat, torch.eye(3, dtype=torch.int64))
+
+
+def test_rotate_vol_round_trips_for_wedge_preserving_flips():
+    torch.manual_seed(0)
+    vol = torch.randn(6, 6, 6)
+    for mat in WEDGE_PRESERVING_FLIPS:
+        flipped = rotate_vol(vol, mat)
+        assert flipped.shape == vol.shape
+        assert not torch.equal(flipped, vol)  # actually does something
+        back = rotate_vol(flipped, mat.T)
+        assert torch.allclose(back, vol)
+
+
+def test_sample_wedge_preserving_flip_deterministic_is_reproducible():
+    for index in range(5):
+        a = sample_wedge_preserving_flip(index, deterministic=True)
+        b = sample_wedge_preserving_flip(index, deterministic=True)
+        assert torch.equal(a, b)
+
+
+def test_sample_wedge_preserving_flip_returns_one_of_the_3():
+    flip_set = {tuple(m.flatten().tolist()) for m in WEDGE_PRESERVING_FLIPS}
+    for index in range(10):
+        mat = sample_wedge_preserving_flip(index, deterministic=True)
+        assert tuple(mat.flatten().tolist()) in flip_set

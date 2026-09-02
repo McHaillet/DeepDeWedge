@@ -53,6 +53,47 @@ def sample_grid_rotation(index, deterministic):
     return rng.choice(GRID_ROTATIONS)
 
 
+def get_wedge_preserving_flips():
+    """
+    Returns the complement of get_grid_rotations' 20 rotations: the 3 non-identity diagonal
+    sign matrices with det=+1 (each flips exactly two of the three axes, keeping the third
+    fixed). A diagonal matrix never swaps axes, so the tilt axis always maps to itself
+    (at most sign-flipped) and the two perpendicular axes never trade places - per
+    get_grid_rotations' docstring, this combination leaves the missing-wedge/CTF orientation
+    unchanged (a symmetric +-tilt-angle wedge is invariant under negating the tilt axis, and
+    mirroring the two perpendicular axes together doesn't touch it either), regardless of
+    which axis is 'tilt_axis'.
+
+    Exact and interpolation-free (via rotate_vol) like get_grid_rotations, but for the
+    opposite reason they're useful: since they don't change the wedge orientation, they're
+    useless for equivariance_loss, but are exactly what a "mirror" data augmentation needs -
+    they still displace any fixed, position-anchored network artifact (e.g. conv boundary or
+    upsampling-checkerboard bias) without invalidating the shared 'ctf' tensor or pushing the
+    model to a wedge orientation it never saw in training.
+    """
+    return [
+        torch.diag(torch.tensor(signs, dtype=torch.int64))
+        for signs in itertools.product([1, -1], repeat=3)
+        if signs.count(-1) == 2
+    ]
+
+
+WEDGE_PRESERVING_FLIPS = get_wedge_preserving_flips()
+
+# separate seed base from BASE_SEED so sampling a flip and a rotation for the same 'index'
+# don't draw from identically-seeded RNG states
+FLIP_BASE_SEED = 999
+
+
+def sample_wedge_preserving_flip(index, deterministic):
+    """
+    Samples one of the 3 wedge-preserving flips (see get_wedge_preserving_flips), the same way
+    sample_grid_rotation samples from GRID_ROTATIONS.
+    """
+    rng = random.Random(FLIP_BASE_SEED + index) if deterministic else random
+    return rng.choice(WEDGE_PRESERVING_FLIPS)
+
+
 def rotate_vol(vol, rot_mat):
     """
     Applies the grid rotation 'rot_mat' (one of get_grid_rotations()'s 20 signed permutation

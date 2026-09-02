@@ -41,6 +41,19 @@ def test_item_shapes_and_value_range(make_subtomo_dir):
     assert item["index"] == 0
 
 
+def test_ctf_dc_bin_forced_to_one(make_subtomo_dir):
+    """
+    The DC bin's on-disk value is the (small) physical CTF amplitude, but __getitem__ must
+    override it to 1 so data_consistency_loss gives it full weight - see SubtomoDataset's
+    docstring.
+    """
+    native, crop = 32, 24
+    root = make_subtomo_dir(native_size=native, crop_size=crop, n_fitting=4, n_val=0)
+    ds = SubtomoDataset(subtomo_dir=str(root / "fitting_subtomos"))
+    for i in range(len(ds)):
+        assert ds[i]["ctf"][0, 0, 0] == 1.0
+
+
 def test_len_ignores_stray_non_pt_files(make_subtomo_dir):
     """
     A stray non-'.pt' file in subtomo0/ (a hidden dotfile, an NFS silly-rename artifact, a

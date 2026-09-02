@@ -74,9 +74,16 @@ def fit_model(
         float,
         typer.Option(
             "--lambda",
-            help="Weight of the equivariance loss term relative to the data-consistency loss term: total loss = data_consistency_loss + lambda * equivariance_loss."
+            help="Weight of the equivariance loss term relative to the data-consistency loss term: total loss = data_consistency_loss + lambda * equivariance_loss + mu * cross_consistency_loss."
         ),
     ] = 2.0,
+    mu_: Annotated[
+        float,
+        typer.Option(
+            "--mu",
+            help="Weight of the cross-branch consistency loss term (see ddw.utils.losses.cross_consistency_loss) relative to the data-consistency loss term: total loss = data_consistency_loss + lambda * equivariance_loss + mu * cross_consistency_loss."
+        ),
+    ] = 1.0,
     logger: Annotated[
         str,
         typer.Option(
@@ -236,6 +243,7 @@ def fit_model(
         adam_params=adam_params_dict,
         subtomo_size=subtomo_size,
         lambda_=lambda_,
+        mu_=mu_,
     )
     # initialize the trainer
     devices = [gpu] if isinstance(gpu, int) else gpu

@@ -9,11 +9,12 @@ import torch
 from ddw.utils.unet import LitUnet3D
 
 
-def _make_lit_unet():
+def _make_lit_unet(**kwargs):
     return LitUnet3D(
         unet_params=dict(chans=2, num_downsample_layers=1),
         adam_params=dict(lr=1e-3),
         subtomo_size=8,
+        **kwargs,
     )
 
 
@@ -49,3 +50,22 @@ def test_rotate_batch_round_trips_with_shared_rot_mats_when_non_deterministic():
     random.random()  # perturb the shared global random state before the "inverse" call
     back = lit_unet._rotate_batch(rotated, rot_mats, inverse=True)
     assert torch.allclose(back, vol)
+
+
+def test_step_combines_dc_eq_cc_losses_weighted_by_lambda_and_mu():
+    torch.manual_seed(0)
+    lit_unet = _make_lit_unet(lambda_=2.0, mu_=3.0)
+    N = 8
+    batch = {
+        "subtomo0": torch.randn(2, N, N, N),
+        "subtomo1": torch.randn(2, N, N, N),
+        "ctf": torch.rand(2, N, N, N // 2 + 1).clamp(0, 1),
+        "index": [0, 1],
+    }
+    loss, dc_loss, eq_loss, cc_loss = lit_unet._step(batch, batch_idx=0, deterministic=True)
+    assert torch.allclose(loss, dc_loss + 2.0 * eq_loss + 3.0 * cc_loss)
+    for term in (loss, dc_loss, eq_loss, cc_loss):
+        assert torch.isfinite(term)
+    # cc_loss's gradient must flow through x_hat_source (not fully detached on both sides,
+    # or the cross-branch term couldn't actually train anything)
+    assert cc_loss.requires_grad

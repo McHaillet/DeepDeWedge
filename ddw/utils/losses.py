@@ -64,3 +64,31 @@ def equivariance_loss(x_double_hat, target, mask, norm="ortho"):
     """
     diff_ft = torch.fft.rfftn(x_double_hat - target, dim=(-3, -2, -1), norm=norm)
     return (mask * diff_ft).abs().pow(2).mean()
+
+
+def cross_consistency_loss(x0_hat, x1_hat, ctf, norm="ortho"):
+    """
+    Direct full-band consistency between the model's two independent-noise estimates of the
+    *same* physical region (one from subtomo0, one from subtomo1) - unlike
+    data_consistency_loss/equivariance_loss, this compares the two estimates to each other
+    directly, rather than each to a raw observation.
+
+    Weighted by (1 - ctf^2), the complement of data_consistency_loss's own effective
+    per-frequency weight: expanding that loss's squared residual '(ctf*x_hat - y)^2' shows its
+    curvature w.r.t. x_hat scales as ctf^2, not ctf, so (1-ctf^2) is what sums to exactly 1
+    with it at every frequency - strongest exactly where dc_loss's constraint is weakest
+    (e.g. near the CTF's low-order zero-crossings), and near-zero where dc_loss already
+    dominates, so this term can't fight or over-smooth the well-constrained high-frequency
+    band (where forcing x0_hat/x1_hat to agree would just be classic Noise2Noise
+    over-smoothing).
+
+    The caller is responsible for breaking the shortcut where the model could satisfy this
+    loss by reproducing the same fixed, position-anchored network artifact (e.g. conv
+    boundary effects) on both sides rather than learning genuine shared content - typically by
+    mirroring one side (a wedge-preserving grid flip - see
+    ddw.utils.rotation.get_wedge_preserving_flips) before/after the forward pass that produced
+    it - and for stop-gradient on one side (standard for a "make two views agree" loss, as
+    with equivariance_loss), to prevent the pair from collapsing to an easy shared constant.
+    """
+    diff_ft = torch.fft.rfftn(x0_hat - x1_hat, dim=(-3, -2, -1), norm=norm)
+    return ((1 - ctf**2) * diff_ft.abs().pow(2)).mean()

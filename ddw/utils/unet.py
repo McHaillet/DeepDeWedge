@@ -6,7 +6,7 @@ import yaml
 from torch import nn
 
 from .fourier import apply_fourier_mask_to_tomo
-from .losses import data_consistency_loss, equivariance_loss
+from .losses import cross_consistency_loss, data_consistency_loss, equivariance_loss
 from .normalization import get_avg_model_input_mean_and_std_from_dataloader
 from .rotation import rotate_vol, sample_grid_rotation
 
@@ -22,12 +22,14 @@ class LitUnet3D(pl.LightningModule):
         adam_params,
         subtomo_size,
         lambda_=2.0,
+        mu_=1.0,
     ):
         super().__init__()
         self.unet_params = unet_params
         self.adam_params = adam_params
         self.subtomo_size = subtomo_size
         self.lambda_ = lambda_
+        self.mu_ = mu_
         self.unet = Unet3D(**self.unet_params)
         # self.ema = ExponentialMovingAverage(self.unet.parameters(), decay=0.995)
         self.save_hyperparameters()
@@ -68,12 +70,12 @@ class LitUnet3D(pl.LightningModule):
 
         # alternate which estimate is rotated + re-degraded to build the equivariance term's
         # model input ("x_hat2") vs. which (the *other*, independent-noise) estimate serves as
-        # its target ("x_hat1"), bounding compute to 3 (rather than 4) forward passes of the
-        # model. The same choice also picks which of the two cross-wise data-consistency
-        # pairings dc_loss evaluates this step (rather than always summing both): only the
-        # "source" branch needs gradients for that, so the "target" branch - only ever used
-        # detached, both here and for the equivariance loss below - is computed under
-        # torch.no_grad() to skip unneeded gradient bookkeeping and speed things up slightly.
+        # its target ("x_hat1"). The same choice also picks which of the two cross-wise
+        # data-consistency pairings dc_loss evaluates this step (rather than always summing
+        # both): only the "source" branch needs gradients for that, so the "target" branch -
+        # only ever used detached, both here and for the equivariance loss below - is computed
+        # under torch.no_grad() to skip unneeded gradient bookkeeping and speed things up
+        # slightly.
         use_branch0_as_source = (
             (batch_idx % 2 == 0) if deterministic else (random.random() < 0.5)
         )
@@ -89,6 +91,11 @@ class LitUnet3D(pl.LightningModule):
         y_cross = subtomo1 if use_branch0_as_source else subtomo0
         dc_loss = data_consistency_loss(x_hat_source, y_cross, ctf)
 
+        # cross-branch consistency: the model's two independent-noise estimates of the same
+        # physical region should agree with each other, especially where dc_loss's own
+        # ctf^2-weighted constraint is weak (see cross_consistency_loss)
+        cc_loss = cross_consistency_loss(x_hat_source, x_hat_target.detach(), ctf)
+
         # sampled once and reused for both the forward and inverse rotation below, so they
         # are guaranteed to exactly cancel (see _sample_rotations)
         rot_mats = self._sample_rotations(batch["index"], deterministic)
@@ -102,11 +109,11 @@ class LitUnet3D(pl.LightningModule):
         x_double_hat_unrot = self._rotate_batch(x_double_hat, rot_mats, inverse=True)
         eq_loss = equivariance_loss(x_double_hat_unrot, x_hat_target.detach(), ctf)
 
-        loss = dc_loss + self.lambda_ * eq_loss
-        return loss, dc_loss, eq_loss
+        loss = dc_loss + self.lambda_ * eq_loss + self.mu_ * cc_loss
+        return loss, dc_loss, eq_loss, cc_loss
 
     def training_step(self, batch, batch_idx):
-        loss, dc_loss, eq_loss = self._step(batch, batch_idx, deterministic=False)
+        loss, dc_loss, eq_loss, cc_loss = self._step(batch, batch_idx, deterministic=False)
         # sync_dist=True: under multi-GPU DDP each rank only sees its own shard, so without
         # this the ModelCheckpoint callbacks that monitor "fitting_loss"/"val_loss" (see
         # fit_model.py) would select checkpoints based on a single rank's partial view of
@@ -114,13 +121,15 @@ class LitUnet3D(pl.LightningModule):
         self.log("fitting_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         self.log("fitting_dc_loss", dc_loss, on_step=False, on_epoch=True, logger=True, sync_dist=True)
         self.log("fitting_eq_loss", eq_loss, on_step=False, on_epoch=True, logger=True, sync_dist=True)
+        self.log("fitting_cc_loss", cc_loss, on_step=False, on_epoch=True, logger=True, sync_dist=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss, dc_loss, eq_loss = self._step(batch, batch_idx, deterministic=True)
+        loss, dc_loss, eq_loss, cc_loss = self._step(batch, batch_idx, deterministic=True)
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         self.log("val_dc_loss", dc_loss, on_step=False, on_epoch=True, logger=True, sync_dist=True)
         self.log("val_eq_loss", eq_loss, on_step=False, on_epoch=True, logger=True, sync_dist=True)
+        self.log("val_cc_loss", cc_loss, on_step=False, on_epoch=True, logger=True, sync_dist=True)
 
     # def on_before_zero_grad(self, optimizer) -> None:
     #     self.ema.update()

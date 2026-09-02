@@ -32,7 +32,8 @@ class SubtomoDataset(Dataset):
     grid-aligned rotations from ddw.utils.rotation.get_grid_rotations, which is exact (no
     interpolation) and preserves shape, so no extra border is needed to rotate into. Both
     share the same physical 'ctf' (values in [0, 1]), since it depends only on the
-    acquisition geometry, not on which half of the frames was used.
+    acquisition geometry, not on which half of the frames was used. The DC bin ([0,0,0]) is
+    forced to 1 on load, overriding its (small) physical value - see __getitem__.
 
     'ctf/{index}.pt' must be given at the same 'subtomo_size' as subtomo0/subtomo1: a CTF,
     unlike a binary missing-wedge mask, has genuine radial/magnitude frequency dependence and
@@ -65,6 +66,10 @@ class SubtomoDataset(Dataset):
         subtomo0 = safe_load(subtomo0_file)
         subtomo1 = safe_load(subtomo1_file)
         ctf = safe_load(f"{self.subtomo_dir}/ctf/{index}.pt")
+        # force full weight at the DC bin: its physical CTF value is only the (tiny)
+        # amplitude-contrast fraction, which would otherwise leave the model's overall
+        # scale/mean almost unconstrained by data_consistency_loss
+        ctf[0, 0, 0] = 1.0
         return {
             "subtomo0": subtomo0,
             "subtomo1": subtomo1,
