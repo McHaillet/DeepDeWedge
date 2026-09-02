@@ -9,6 +9,7 @@ from .fourier import apply_fourier_mask_to_tomo
 from .losses import cross_consistency_loss, data_consistency_loss, equivariance_loss
 from .normalization import get_avg_model_input_mean_and_std_from_dataloader
 from .rotation import rotate_vol, sample_grid_rotation
+from .subtomos import get_hann_edge_weights
 
 
 class LitUnet3D(pl.LightningModule):
@@ -23,6 +24,7 @@ class LitUnet3D(pl.LightningModule):
         subtomo_size,
         lambda_=2.0,
         mu_=1.0,
+        edge_taper_width=4,
     ):
         super().__init__()
         self.unet_params = unet_params
@@ -30,9 +32,23 @@ class LitUnet3D(pl.LightningModule):
         self.subtomo_size = subtomo_size
         self.lambda_ = lambda_
         self.mu_ = mu_
+        self.edge_taper_width = edge_taper_width
         self.unet = Unet3D(**self.unet_params)
         # self.ema = ExponentialMovingAverage(self.unet.parameters(), decay=0.995)
         self.save_hyperparameters()
+
+        # real-space per-voxel weight down-weighting the outermost 'edge_taper_width' voxels
+        # in all three losses (less reliable: less receptive-field context, zero-padding
+        # boundary effects at every conv layer). A fixed function of position only (see
+        # get_hann_edge_weights), identical for every sample/batch/epoch, so it's computed
+        # once here rather than in _step. persistent=False: it's fully determined by
+        # subtomo_size/edge_taper_width (both already in hparams), so it's cheaply
+        # recomputed on load rather than bloating checkpoints.
+        self.register_buffer(
+            "edge_weight",
+            get_hann_edge_weights(subtomo_size, self.edge_taper_width).float(),
+            persistent=False,
+        )
 
     def forward(self, x):
         return self.unet(x.unsqueeze(1)).squeeze(
@@ -89,12 +105,14 @@ class LitUnet3D(pl.LightningModule):
                 x_hat_target = self(subtomo0)
 
         y_cross = subtomo1 if use_branch0_as_source else subtomo0
-        dc_loss = data_consistency_loss(x_hat_source, y_cross, ctf)
+        dc_loss = data_consistency_loss(x_hat_source, y_cross, ctf, weight=self.edge_weight)
 
         # cross-branch consistency: the model's two independent-noise estimates of the same
         # physical region should agree with each other, especially where dc_loss's own
         # ctf^2-weighted constraint is weak (see cross_consistency_loss)
-        cc_loss = cross_consistency_loss(x_hat_source, x_hat_target.detach(), ctf)
+        cc_loss = cross_consistency_loss(
+            x_hat_source, x_hat_target.detach(), ctf, edge_weight=self.edge_weight
+        )
 
         # sampled once and reused for both the forward and inverse rotation below, so they
         # are guaranteed to exactly cancel (see _sample_rotations)
@@ -107,7 +125,9 @@ class LitUnet3D(pl.LightningModule):
         z = apply_fourier_mask_to_tomo(x_hat_source_rot, ctf)
         x_double_hat = self(z)
         x_double_hat_unrot = self._rotate_batch(x_double_hat, rot_mats, inverse=True)
-        eq_loss = equivariance_loss(x_double_hat_unrot, x_hat_target.detach(), ctf)
+        eq_loss = equivariance_loss(
+            x_double_hat_unrot, x_hat_target.detach(), ctf, edge_weight=self.edge_weight
+        )
 
         loss = dc_loss + self.lambda_ * eq_loss + self.mu_ * cc_loss
         return loss, dc_loss, eq_loss, cc_loss

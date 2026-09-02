@@ -3,7 +3,7 @@ import torch
 from .fourier import apply_fourier_mask_to_tomo
 
 
-def data_consistency_loss(x_hat, y, ctf):
+def data_consistency_loss(x_hat, y, ctf, weight=None):
     """
     Noise2Noise-style data-consistency loss, for one estimate/observation pair. 'x_hat' is
     the model's estimate from one of the two independent-noise raw observations; 'y' is the
@@ -19,13 +19,21 @@ def data_consistency_loss(x_hat, y, ctf):
     target are ~0 there) - unlike the old two-region masked_loss, no extra region weighting
     is needed to handle this, which matters for a continuous (non-binary) CTF.
 
+    'weight', if given, is an optional real-space per-voxel multiplier on the squared
+    residual (e.g. a Hann taper down-weighting sub-tomogram edges - see
+    ddw.utils.subtomos.get_hann_edge_weights) - broadcastable against the residual's
+    (..., D, H, W) shape.
+
     LitUnet3D._step calls this once per step, with the (x_hat, y) pair picked at random
     between the two possible cross-wise pairings - see its docstring/comments for why.
     """
-    return (apply_fourier_mask_to_tomo(x_hat, ctf) - y).pow(2).mean()
+    residual_sq = (apply_fourier_mask_to_tomo(x_hat, ctf) - y).pow(2)
+    if weight is not None:
+        residual_sq = weight * residual_sq
+    return residual_sq.mean()
 
 
-def equivariance_loss(x_double_hat, target, mask, norm="ortho"):
+def equivariance_loss(x_double_hat, target, mask, norm="ortho", edge_weight=None):
     """
     Equivariant-imaging-style self-consistency loss, cross-paired the same way as
     data_consistency_loss: the caller rotates and re-masks (with the canonical, native-
@@ -61,12 +69,22 @@ def equivariance_loss(x_double_hat, target, mask, norm="ortho"):
     the real-space volume too - so '.mean()' over the (masked) frequency-domain elements lands
     on the same scale as the real-space MSE used by data_consistency_loss, with no extra
     scaling factor needed.
+
+    'edge_weight', if given, is an optional real-space per-voxel multiplier (e.g. a Hann taper
+    - see ddw.utils.subtomos.get_hann_edge_weights) applied to 'x_double_hat - target' *before*
+    the FFT, since there's no real-space step left afterward to weight. By the convolution
+    theorem this convolves the residual's true spectrum with the window's own - some spectral
+    leakage between neighboring frequency bins - which is negligible for a taper confined to a
+    few edge voxels, since such a window is close to flat (its own spectrum close to a delta).
     """
-    diff_ft = torch.fft.rfftn(x_double_hat - target, dim=(-3, -2, -1), norm=norm)
+    diff = x_double_hat - target
+    if edge_weight is not None:
+        diff = edge_weight * diff
+    diff_ft = torch.fft.rfftn(diff, dim=(-3, -2, -1), norm=norm)
     return (mask * diff_ft).abs().pow(2).mean()
 
 
-def cross_consistency_loss(x0_hat, x1_hat, ctf, norm="ortho"):
+def cross_consistency_loss(x0_hat, x1_hat, ctf, norm="ortho", edge_weight=None):
     """
     Direct full-band consistency between the model's two independent-noise estimates of the
     *same* physical region (one from subtomo0, one from subtomo1) - unlike
@@ -82,13 +100,16 @@ def cross_consistency_loss(x0_hat, x1_hat, ctf, norm="ortho"):
     band (where forcing x0_hat/x1_hat to agree would just be classic Noise2Noise
     over-smoothing).
 
-    The caller is responsible for breaking the shortcut where the model could satisfy this
-    loss by reproducing the same fixed, position-anchored network artifact (e.g. conv
-    boundary effects) on both sides rather than learning genuine shared content - typically by
-    mirroring one side (a wedge-preserving grid flip - see
-    ddw.utils.rotation.get_wedge_preserving_flips) before/after the forward pass that produced
-    it - and for stop-gradient on one side (standard for a "make two views agree" loss, as
-    with equivariance_loss), to prevent the pair from collapsing to an easy shared constant.
+    The caller is responsible for stop-gradient on one side (standard for a "make two views
+    agree" loss, as with equivariance_loss), to prevent the pair from collapsing to an easy
+    shared constant.
+
+    'edge_weight' is applied the same way as in equivariance_loss: a real-space per-voxel
+    multiplier on 'x0_hat - x1_hat' before the FFT - see that function's docstring for the
+    spectral-leakage caveat.
     """
-    diff_ft = torch.fft.rfftn(x0_hat - x1_hat, dim=(-3, -2, -1), norm=norm)
+    diff = x0_hat - x1_hat
+    if edge_weight is not None:
+        diff = edge_weight * diff
+    diff_ft = torch.fft.rfftn(diff, dim=(-3, -2, -1), norm=norm)
     return ((1 - ctf**2) * diff_ft.abs().pow(2)).mean()

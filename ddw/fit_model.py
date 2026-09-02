@@ -84,6 +84,12 @@ def fit_model(
             help="Weight of the cross-branch consistency loss term (see ddw.utils.losses.cross_consistency_loss) relative to the data-consistency loss term: total loss = data_consistency_loss + lambda * equivariance_loss + mu * cross_consistency_loss."
         ),
     ] = 1.0,
+    edge_taper_width: Annotated[
+        int,
+        typer.Option(
+            help="Width (in voxels) of the Hann taper down-weighting sub-tomogram edges in all three loss terms - see ddw.utils.subtomos.get_hann_edge_weights. 0 disables edge down-weighting."
+        ),
+    ] = 4,
     logger: Annotated[
         str,
         typer.Option(
@@ -244,6 +250,7 @@ def fit_model(
         subtomo_size=subtomo_size,
         lambda_=lambda_,
         mu_=mu_,
+        edge_taper_width=edge_taper_width,
     )
     # initialize the trainer
     devices = [gpu] if isinstance(gpu, int) else gpu

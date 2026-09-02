@@ -168,6 +168,51 @@ def get_linear_ramp_weights(subtomo_size, subtomo_overlap):
     return torch.from_numpy(weight_map_3d)
 
 
+def get_hann_edge_weights(subtomo_size, taper_width):
+    """
+    Produces a cubic 3D tensor of per-voxel weights, 1 everywhere except a raised-cosine
+    (Hann) taper down to 0 at the outermost 'taper_width' voxels on each face - used to
+    down-weight sub-tomogram edges in the training losses, where predictions are less
+    reliable (less receptive-field context, zero-padding boundary effects at every conv
+    layer). 'taper_width' is a single int (same width on all three axes) or a 3-tuple/list of
+    per-axis widths; a width of 0 disables tapering on that axis (weight 1 everywhere along
+    it).
+
+    Unlike get_linear_ramp_weights' linear taper, the raised cosine has zero derivative at
+    both ends of the transition (the true edge and where it meets the flat interior), so it's
+    C1-continuous everywhere - not just smoother in the abstract, but specifically relevant
+    when this weight is applied to a signal before an FFT (see equivariance_loss/
+    cross_consistency_loss's 'edge_weight'): a derivative kink (as the linear ramp has where
+    it meets the flat region) injects slower-decaying spectral leakage into neighboring
+    frequency bins than a smooth taper does.
+    """
+    if isinstance(taper_width, (int, np.integer)):
+        taper_width = 3 * [taper_width]
+
+    weight_maps_1d = []
+    for width in taper_width:
+        # cap at size // 2: wider than that, the head and tail taper slices below overlap
+        # and the second overwrites part of the first, producing a non-monotonic double-dip
+        # instead of a smooth taper
+        width = min(width, subtomo_size // 2)
+        weight_map_1d = np.ones(subtomo_size)
+        if width > 0:
+            # raised cosine from 0 (outermost voxel) to 1 (at 'width' voxels in); denominator
+            # guards width=1, where there's only the one, fully-zeroed voxel to place
+            ramp = 0.5 * (1 - np.cos(np.pi * np.arange(width) / max(width - 1, 1)))
+            weight_map_1d[:width] = ramp  # taper up at the start
+            weight_map_1d[-width:] = ramp[::-1]  # and down at the end
+        weight_maps_1d.append(weight_map_1d)
+
+    # outer product of the three 1D weight maps into one 3D weight map
+    weight_map_3d = (
+        weight_maps_1d[0][:, None, None]
+        * weight_maps_1d[1][None, :, None]
+        * weight_maps_1d[2][None, None, :]
+    )
+    return torch.from_numpy(weight_map_3d)
+
+
 # def try_to_sample_non_overlapping_subtomo_ids(
 #     subtomo_start_coords, subtomo_size, target_sample_size, max_tries=1, verbose=True
 # ):
