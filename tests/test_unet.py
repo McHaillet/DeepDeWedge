@@ -72,20 +72,22 @@ def test_step_combines_dc_and_eq_losses_weighted_by_lambda():
 
 def test_step_reinjects_random_noise_before_second_pass():
     """
-    eq_loss's second-pass input gets noise re-added before ctf is re-applied (see _step's
-    comments). With deterministic=True everything else about _step is deterministic (fixed
-    rotation, fixed source/target branch), so calling it twice without reseeding must still
-    give different eq_loss values - the only remaining source of randomness is the injected
-    noise.
+    eq_loss's second-pass input gets a real noise sample transplanted in, shuffled across the
+    batch (see _step's comments). With deterministic=True everything else about _step is
+    deterministic (fixed rotation, fixed source/target branch), so calling it twice without
+    reseeding must still give different eq_loss values - the only remaining source of
+    randomness is the batch permutation. Batch size is large enough that two independent
+    permutations coinciding is negligible.
     """
     torch.manual_seed(0)
     lit_unet = _make_lit_unet()
     N = 8
+    B = 6
     batch = {
-        "subtomo0": torch.randn(2, N, N, N),
-        "subtomo1": torch.randn(2, N, N, N),
-        "ctf": torch.rand(2, N, N, N // 2 + 1).clamp(0, 1),
-        "index": [0, 1],
+        "subtomo0": torch.randn(B, N, N, N),
+        "subtomo1": torch.randn(B, N, N, N),
+        "ctf": torch.rand(B, N, N, N // 2 + 1).clamp(0, 1),
+        "index": list(range(B)),
     }
     _, _, eq_loss_a = lit_unet._step(batch, batch_idx=0, deterministic=True)
     _, _, eq_loss_b = lit_unet._step(batch, batch_idx=0, deterministic=True)

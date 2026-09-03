@@ -98,28 +98,15 @@ class LitUnet3D(pl.LightningModule):
         # eq_loss should only flow through the second application of self() below
         x_hat_source_rot = self._rotate_batch(x_hat_source.detach(), rot_mats)
 
-        # re-inject noise before re-masking, so the second pass's input isn't unrealistically
-        # clean (out-of-distribution vs. what the model normally sees) - added pre-ctf so it's
-        # zeroed in the missing wedge like real noise, not left as a tell. 'delta' makes up the
-        # gap between the raw noise level and what the model's own two estimates still disagree
-        # by (variances add) - recomputed every step, detached (a fixed scale, not learnable).
-        # Same trick as IsoNet2's isonet2-n2n mode. x_hat_source/target are full-band (already
-        # deconvolved/filled) estimates, unlike the band-limited subtomo0/1, so their raw diff
-        # isn't comparable to noise_std - it'd be inflated by missing-wedge disagreement that's
-        # genuine reconstruction uncertainty, not noise. Re-masking the diff by ctf first keeps
-        # both sides of the subtraction on the same (observed) footing.
-        noise_std = torch.std(subtomo0 - subtomo1) / 2**0.5
-        masked_diff = apply_fourier_mask_to_tomo(x_hat_source.detach() - x_hat_target, ctf)
-        new_noise_std = torch.std(masked_diff) / 2**0.5
-        delta_noise_std = torch.sqrt(torch.abs(noise_std**2 - new_noise_std**2))
-        # 'delta' is a post-mask target, but injection happens pre-mask (above) - ctf will
-        # attenuate whatever we inject here too, so scale up by how much it attenuates a
-        # flat-spectrum signal (Parseval: mean(ctf^2)) to compensate.
-        ctf_attenuation = torch.sqrt((ctf**2).mean())
-        pre_mask_noise_std = delta_noise_std / (ctf_attenuation + 1e-6)
-        noisy_input = x_hat_source_rot + pre_mask_noise_std * torch.randn_like(x_hat_source_rot)
-
-        z = apply_fourier_mask_to_tomo(noisy_input, ctf)
+        # re-inject noise before the second pass, so its input isn't unrealistically clean
+        # (out-of-distribution vs. what the model normally sees). Rather than modeling the
+        # noise, transplant a real sample of it: (subtomo0-subtomo1)/sqrt(2) is an exact draw
+        # from the true per-sample noise (right spectral shape, right wedge, no assumptions
+        # needed), shuffled across the batch so it doesn't correlate with this sample's own
+        # dc_loss target.
+        raw_noise = (subtomo0 - subtomo1) / 2**0.5
+        donor_noise = raw_noise[torch.randperm(raw_noise.shape[0])]
+        z = apply_fourier_mask_to_tomo(x_hat_source_rot, ctf) + donor_noise
         x_double_hat = self(z)
         x_double_hat_unrot = self._rotate_batch(x_double_hat, rot_mats, inverse=True)
         eq_loss = equivariance_loss(x_double_hat_unrot, x_hat_target.detach(), ctf)
