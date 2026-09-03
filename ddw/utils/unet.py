@@ -103,11 +103,21 @@ class LitUnet3D(pl.LightningModule):
         # zeroed in the missing wedge like real noise, not left as a tell. 'delta' makes up the
         # gap between the raw noise level and what the model's own two estimates still disagree
         # by (variances add) - recomputed every step, detached (a fixed scale, not learnable).
-        # Same trick as IsoNet2's isonet2-n2n mode.
+        # Same trick as IsoNet2's isonet2-n2n mode. x_hat_source/target are full-band (already
+        # deconvolved/filled) estimates, unlike the band-limited subtomo0/1, so their raw diff
+        # isn't comparable to noise_std - it'd be inflated by missing-wedge disagreement that's
+        # genuine reconstruction uncertainty, not noise. Re-masking the diff by ctf first keeps
+        # both sides of the subtraction on the same (observed) footing.
         noise_std = torch.std(subtomo0 - subtomo1) / 2**0.5
-        new_noise_std = torch.std(x_hat_source.detach() - x_hat_target) / 2**0.5
+        masked_diff = apply_fourier_mask_to_tomo(x_hat_source.detach() - x_hat_target, ctf)
+        new_noise_std = torch.std(masked_diff) / 2**0.5
         delta_noise_std = torch.sqrt(torch.abs(noise_std**2 - new_noise_std**2))
-        noisy_input = x_hat_source_rot + delta_noise_std * torch.randn_like(x_hat_source_rot)
+        # 'delta' is a post-mask target, but injection happens pre-mask (above) - ctf will
+        # attenuate whatever we inject here too, so scale up by how much it attenuates a
+        # flat-spectrum signal (Parseval: mean(ctf^2)) to compensate.
+        ctf_attenuation = torch.sqrt((ctf**2).mean())
+        pre_mask_noise_std = delta_noise_std / (ctf_attenuation + 1e-6)
+        noisy_input = x_hat_source_rot + pre_mask_noise_std * torch.randn_like(x_hat_source_rot)
 
         z = apply_fourier_mask_to_tomo(noisy_input, ctf)
         x_double_hat = self(z)
