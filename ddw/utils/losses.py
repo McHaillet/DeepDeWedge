@@ -3,7 +3,7 @@ import torch
 from .fourier import apply_fourier_mask_to_tomo
 
 
-def data_consistency_loss(x_hat, y, ctf, norm="ortho", eps=1.0):
+def data_consistency_loss(x_hat, y, ctf):
     """
     Noise2Noise-style data-consistency loss, for one estimate/observation pair. 'x_hat' is
     the model's estimate from one of the two independent-noise raw observations; 'y' is the
@@ -19,39 +19,11 @@ def data_consistency_loss(x_hat, y, ctf, norm="ortho", eps=1.0):
     target are ~0 there) - unlike the old two-region masked_loss, no extra region weighting
     is needed to handle this, which matters for a continuous (non-binary) CTF.
 
-    Computed as a Charbonnier (smooth-L1) loss, 'sqrt(r^2 + eps^2) - eps', on the real-space
-    residual's *Fourier-domain* magnitude, rather than plain real-space MSE. Reasoning: by the
-    chain rule, d/d(x_hat) of any loss on 'ctf*x_hat - y' carries an outer factor of 'ctf', so
-    plain MSE's 'L'(r) = 2r' makes the gradient scale as ctf^2 - aggressively starving
-    frequencies where 'ctf' is small but nonzero (it can't help where 'ctf' is exactly zero -
-    that outer factor kills the gradient there regardless of 'L'). Charbonnier's derivative
-    saturates to a constant magnitude once the residual exceeds 'eps', instead of continuing
-    to shrink with it - so past that transition the gradient scales as ctf, not ctf^2. This
-    only cleanly targets frequencies *by ctf value* when applied per Fourier bin, since a
-    real-space voxel mixes every frequency together. The residual is still computed in real
-    space first (via apply_fourier_mask_to_tomo, same as before) and only then FFT'd, rather
-    than comparing 'ctf*rfftn(x_hat)' against 'rfftn(y)' directly - the latter would silently
-    assume 'ctf' is symmetric under negated frequency, which a real residual's rfftn doesn't.
-
-    Unlike squared-residual MSE, Parseval's theorem doesn't guarantee this lands on the same
-    absolute scale as the old real-space-MSE version - 'eps' (and 'lambda_' downstream) will
-    likely need retuning against this loss's own residual scale.
-
-    'eps' sets the Charbonnier transition and should be tuned to the data's actual per-
-    frequency noise scale: well below it, this is close to L1 (constant-magnitude gradient,
-    more outlier-robust but noisier convergence near the optimum); well above it, this is
-    close to plain MSE (no change from the old behavior). LitUnet3D doesn't hardcode this -
-    see its update_dc_loss_eps/ddw.utils.normalization.get_avg_dc_loss_eps_from_dataloader,
-    which calibrate it once from the training data's own noise scale.
-
     LitUnet3D._step calls this once per step, with the (x_hat, y) pair picked at random
     between the two possible cross-wise pairings - see its docstring/comments for why.
     """
-    diff = apply_fourier_mask_to_tomo(x_hat, ctf) - y
-    diff_ft = torch.fft.rfftn(diff, dim=(-3, -2, -1), norm=norm)
-    residual = diff_ft.abs()
-    loss = torch.sqrt(residual**2 + eps**2) - eps
-    return loss.mean()
+    residual_sq = (apply_fourier_mask_to_tomo(x_hat, ctf) - y).pow(2)
+    return residual_sq.mean()
 
 
 def equivariance_loss(x_double_hat, target, mask, norm="ortho"):

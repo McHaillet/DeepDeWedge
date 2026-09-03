@@ -60,18 +60,14 @@ def test_data_consistency_loss_ignores_zero_ctf_frequencies():
     assert torch.allclose(loss_a, loss_b, atol=1e-4)
 
 
-def test_data_consistency_loss_matches_manual_charbonnier_fourier_residual():
+def test_data_consistency_loss_matches_manual_real_space_mse():
     torch.manual_seed(0)
     N = 8
     ctf = torch.rand(N, N, N // 2 + 1).clamp(0, 1)
     x_hat = torch.randn(N, N, N)
     y = torch.randn(N, N, N)
-    eps = 0.3
-    diff = apply_fourier_mask_to_tomo(x_hat, ctf) - y
-    diff_ft = torch.fft.rfftn(diff, dim=(-3, -2, -1), norm="ortho")
-    residual = diff_ft.abs()
-    expected = (torch.sqrt(residual**2 + eps**2) - eps).mean()
-    assert torch.allclose(data_consistency_loss(x_hat, y, ctf, eps=eps), expected)
+    expected = (apply_fourier_mask_to_tomo(x_hat, ctf) - y).pow(2).mean()
+    assert torch.allclose(data_consistency_loss(x_hat, y, ctf), expected)
 
 
 def test_equivariance_loss_zero_when_identical():

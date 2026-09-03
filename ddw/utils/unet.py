@@ -7,10 +7,7 @@ from torch import nn
 
 from .fourier import apply_fourier_mask_to_tomo
 from .losses import data_consistency_loss, equivariance_loss
-from .normalization import (
-    get_avg_dc_loss_eps_from_dataloader,
-    get_avg_model_input_mean_and_std_from_dataloader,
-)
+from .normalization import get_avg_model_input_mean_and_std_from_dataloader
 from .rotation import rotate_vol, sample_grid_rotation
 
 
@@ -34,11 +31,6 @@ class LitUnet3D(pl.LightningModule):
         self.unet = Unet3D(**self.unet_params)
         # self.ema = ExponentialMovingAverage(self.unet.parameters(), decay=0.995)
         self.save_hyperparameters()
-
-        # placeholder until update_dc_loss_eps calibrates it in on_train_start; a real
-        # (persistent) buffer since, unlike edge_weight, it's an estimated statistic that
-        # must round-trip through checkpoints rather than being recomputed on load.
-        self.register_buffer("dc_loss_eps", torch.tensor(1.0))
 
     def forward(self, x):
         return self.unet(x.unsqueeze(1)).squeeze(
@@ -95,7 +87,7 @@ class LitUnet3D(pl.LightningModule):
                 x_hat_target = self(subtomo0)
 
         y_cross = subtomo1 if use_branch0_as_source else subtomo0
-        dc_loss = data_consistency_loss(x_hat_source, y_cross, ctf, eps=self.dc_loss_eps)
+        dc_loss = data_consistency_loss(x_hat_source, y_cross, ctf)
 
         # sampled once and reused for both the forward and inverse rotation below, so they
         # are guaranteed to exactly cancel (see _sample_rotations)
@@ -105,7 +97,19 @@ class LitUnet3D(pl.LightningModule):
         # anyway by design (standard equivariant-imaging stop-gradient): the gradient of
         # eq_loss should only flow through the second application of self() below
         x_hat_source_rot = self._rotate_batch(x_hat_source.detach(), rot_mats)
-        z = apply_fourier_mask_to_tomo(x_hat_source_rot, ctf)
+
+        # re-inject noise before re-masking, so the second pass's input isn't unrealistically
+        # clean (out-of-distribution vs. what the model normally sees) - added pre-ctf so it's
+        # zeroed in the missing wedge like real noise, not left as a tell. 'delta' makes up the
+        # gap between the raw noise level and what the model's own two estimates still disagree
+        # by (variances add) - recomputed every step, detached (a fixed scale, not learnable).
+        # Same trick as IsoNet2's isonet2-n2n mode.
+        noise_std = torch.std(subtomo0 - subtomo1) / 2**0.5
+        new_noise_std = torch.std(x_hat_source.detach() - x_hat_target) / 2**0.5
+        delta_noise_std = torch.sqrt(torch.abs(noise_std**2 - new_noise_std**2))
+        noisy_input = x_hat_source_rot + delta_noise_std * torch.randn_like(x_hat_source_rot)
+
+        z = apply_fourier_mask_to_tomo(noisy_input, ctf)
         x_double_hat = self(z)
         x_double_hat_unrot = self._rotate_batch(x_double_hat, rot_mats, inverse=True)
         eq_loss = equivariance_loss(x_double_hat_unrot, x_hat_target.detach(), ctf)
@@ -136,7 +140,6 @@ class LitUnet3D(pl.LightningModule):
     def on_train_start(self) -> None:
         if self.current_epoch == 0:
             self.update_normalization()
-            self.update_dc_loss_eps()
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), **self.adam_params)
@@ -164,17 +167,6 @@ class LitUnet3D(pl.LightningModule):
         self.update_hparam("unet_params", self.unet_params)
         self.log("normalization/loc", loc)
         self.log("normalization/scale", scale)
-
-    def update_dc_loss_eps(self):
-        """
-        Calibrates data_consistency_loss's Charbonnier 'eps' threshold from the training
-        data's own noise scale (see get_avg_dc_loss_eps_from_dataloader).
-        """
-        eps = get_avg_dc_loss_eps_from_dataloader(
-            dataloader=self.trainer.train_dataloader, verbose=True
-        )
-        self.dc_loss_eps = torch.tensor(eps, device=self.dc_loss_eps.device)
-        self.log("dc_loss_eps", eps)
 
     def update_hparam(self, hparam, value):
         """
