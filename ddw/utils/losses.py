@@ -3,7 +3,7 @@ import torch
 from .fourier import apply_fourier_mask_to_tomo
 
 
-def data_consistency_loss(x_hat, y, ctf, weight=None):
+def data_consistency_loss(x_hat, y, ctf, norm="ortho", eps=1.0):
     """
     Noise2Noise-style data-consistency loss, for one estimate/observation pair. 'x_hat' is
     the model's estimate from one of the two independent-noise raw observations; 'y' is the
@@ -19,21 +19,42 @@ def data_consistency_loss(x_hat, y, ctf, weight=None):
     target are ~0 there) - unlike the old two-region masked_loss, no extra region weighting
     is needed to handle this, which matters for a continuous (non-binary) CTF.
 
-    'weight', if given, is an optional real-space per-voxel multiplier on the squared
-    residual (e.g. a Hann taper down-weighting sub-tomogram edges - see
-    ddw.utils.subtomos.get_hann_edge_weights) - broadcastable against the residual's
-    (..., D, H, W) shape.
+    Computed as a Charbonnier (smooth-L1) loss, 'sqrt(r^2 + eps^2) - eps', on the real-space
+    residual's *Fourier-domain* magnitude, rather than plain real-space MSE. Reasoning: by the
+    chain rule, d/d(x_hat) of any loss on 'ctf*x_hat - y' carries an outer factor of 'ctf', so
+    plain MSE's 'L'(r) = 2r' makes the gradient scale as ctf^2 - aggressively starving
+    frequencies where 'ctf' is small but nonzero (it can't help where 'ctf' is exactly zero -
+    that outer factor kills the gradient there regardless of 'L'). Charbonnier's derivative
+    saturates to a constant magnitude once the residual exceeds 'eps', instead of continuing
+    to shrink with it - so past that transition the gradient scales as ctf, not ctf^2. This
+    only cleanly targets frequencies *by ctf value* when applied per Fourier bin, since a
+    real-space voxel mixes every frequency together. The residual is still computed in real
+    space first (via apply_fourier_mask_to_tomo, same as before) and only then FFT'd, rather
+    than comparing 'ctf*rfftn(x_hat)' against 'rfftn(y)' directly - the latter would silently
+    assume 'ctf' is symmetric under negated frequency, which a real residual's rfftn doesn't.
+
+    Unlike squared-residual MSE, Parseval's theorem doesn't guarantee this lands on the same
+    absolute scale as the old real-space-MSE version - 'eps' (and 'lambda_' downstream) will
+    likely need retuning against this loss's own residual scale.
+
+    'eps' sets the Charbonnier transition and should be tuned to the data's actual per-
+    frequency noise scale: well below it, this is close to L1 (constant-magnitude gradient,
+    more outlier-robust but noisier convergence near the optimum); well above it, this is
+    close to plain MSE (no change from the old behavior). LitUnet3D doesn't hardcode this -
+    see its update_dc_loss_eps/ddw.utils.normalization.get_avg_dc_loss_eps_from_dataloader,
+    which calibrate it once from the training data's own noise scale.
 
     LitUnet3D._step calls this once per step, with the (x_hat, y) pair picked at random
     between the two possible cross-wise pairings - see its docstring/comments for why.
     """
-    residual_sq = (apply_fourier_mask_to_tomo(x_hat, ctf) - y).pow(2)
-    if weight is not None:
-        residual_sq = weight * residual_sq
-    return residual_sq.mean()
+    diff = apply_fourier_mask_to_tomo(x_hat, ctf) - y
+    diff_ft = torch.fft.rfftn(diff, dim=(-3, -2, -1), norm=norm)
+    residual = diff_ft.abs()
+    loss = torch.sqrt(residual**2 + eps**2) - eps
+    return loss.mean()
 
 
-def equivariance_loss(x_double_hat, target, mask, norm="ortho", edge_weight=None):
+def equivariance_loss(x_double_hat, target, mask, norm="ortho"):
     """
     Equivariant-imaging-style self-consistency loss, cross-paired the same way as
     data_consistency_loss: the caller rotates and re-masks (with the canonical, native-
@@ -55,7 +76,11 @@ def equivariance_loss(x_double_hat, target, mask, norm="ortho", edge_weight=None
     model's input upstream of this loss, it is never applied as a forward measurement
     operator. It's fine for 'mask''s own (rotation-invariant) zero-crossings to stay unfilled:
     there's no real data there in either representation, and weighting the comparison by
-    'mask' means this loss doesn't force them to be recovered.
+    'mask' means this loss doesn't force them to be recovered. Applied linearly to the squared
+    residual (mask * |diff_ft|^2, not (mask*diff_ft)'s squared magnitude, which would double
+    up to mask^2) - unlike data_consistency_loss's ctf^2, an emergent side effect of chain-
+    ruling ctf through MSE, this weight is explicit and chosen directly, so it's applied at
+    the exponent it's meant to carry rather than incidentally squared.
 
     Both 'x_double_hat' and 'target' must be constructed from detached estimates by the
     caller - a standard equivariant-imaging stop-gradient, not a limitation of rotate_vol
@@ -69,47 +94,7 @@ def equivariance_loss(x_double_hat, target, mask, norm="ortho", edge_weight=None
     the real-space volume too - so '.mean()' over the (masked) frequency-domain elements lands
     on the same scale as the real-space MSE used by data_consistency_loss, with no extra
     scaling factor needed.
-
-    'edge_weight', if given, is an optional real-space per-voxel multiplier (e.g. a Hann taper
-    - see ddw.utils.subtomos.get_hann_edge_weights) applied to 'x_double_hat - target' *before*
-    the FFT, since there's no real-space step left afterward to weight. By the convolution
-    theorem this convolves the residual's true spectrum with the window's own - some spectral
-    leakage between neighboring frequency bins - which is negligible for a taper confined to a
-    few edge voxels, since such a window is close to flat (its own spectrum close to a delta).
     """
     diff = x_double_hat - target
-    if edge_weight is not None:
-        diff = edge_weight * diff
     diff_ft = torch.fft.rfftn(diff, dim=(-3, -2, -1), norm=norm)
-    return (mask * diff_ft).abs().pow(2).mean()
-
-
-def cross_consistency_loss(x0_hat, x1_hat, ctf, norm="ortho", edge_weight=None):
-    """
-    Direct full-band consistency between the model's two independent-noise estimates of the
-    *same* physical region (one from subtomo0, one from subtomo1) - unlike
-    data_consistency_loss/equivariance_loss, this compares the two estimates to each other
-    directly, rather than each to a raw observation.
-
-    Weighted by (1 - ctf^2), the complement of data_consistency_loss's own effective
-    per-frequency weight: expanding that loss's squared residual '(ctf*x_hat - y)^2' shows its
-    curvature w.r.t. x_hat scales as ctf^2, not ctf, so (1-ctf^2) is what sums to exactly 1
-    with it at every frequency - strongest exactly where dc_loss's constraint is weakest
-    (e.g. near the CTF's low-order zero-crossings), and near-zero where dc_loss already
-    dominates, so this term can't fight or over-smooth the well-constrained high-frequency
-    band (where forcing x0_hat/x1_hat to agree would just be classic Noise2Noise
-    over-smoothing).
-
-    The caller is responsible for stop-gradient on one side (standard for a "make two views
-    agree" loss, as with equivariance_loss), to prevent the pair from collapsing to an easy
-    shared constant.
-
-    'edge_weight' is applied the same way as in equivariance_loss: a real-space per-voxel
-    multiplier on 'x0_hat - x1_hat' before the FFT - see that function's docstring for the
-    spectral-leakage caveat.
-    """
-    diff = x0_hat - x1_hat
-    if edge_weight is not None:
-        diff = edge_weight * diff
-    diff_ft = torch.fft.rfftn(diff, dim=(-3, -2, -1), norm=norm)
-    return ((1 - ctf**2) * diff_ft.abs().pow(2)).mean()
+    return (mask * diff_ft.abs().pow(2)).mean()

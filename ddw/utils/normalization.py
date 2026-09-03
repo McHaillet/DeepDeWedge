@@ -78,3 +78,48 @@ def get_avg_model_input_mean_and_std_from_dataloader(dataloader, batches=None, v
         stats /= torch.distributed.get_world_size()
     mean, var = stats[0].cpu().item(), stats[1].cpu().item()
     return mean, var**0.5
+
+
+def get_avg_dc_loss_eps_from_dataloader(dataloader, batches=None, verbose=False):
+    """
+    Estimates the data's own noise scale, to calibrate data_consistency_loss's Charbonnier
+    'eps' threshold (see ddw.utils.losses.data_consistency_loss) - called once from
+    LitUnet3D.update_dc_loss_eps.
+
+    'subtomo0' and 'subtomo1' observe the same physical region with the same 'ctf' but
+    independent noise, so 'subtomo0 - subtomo1' cancels both the signal and 'ctf' and leaves
+    pure noise (n0 - n1); its rfftn magnitude is therefore a direct, assumption-free estimate
+    of the data's actual per-voxel noise scale, without needing to know 'ctf' or the true
+    signal at all. Dividing by sqrt(2) accounts for 'n0 - n1' being the difference of two
+    independent, identically-distributed noise sources rather than one.
+
+    Same dataloader/DDP-averaging conventions as
+    get_avg_model_input_mean_and_std_from_dataloader (see its docstring) - only accepts
+    SubtomoDataset-style batches with "subtomo0"/"subtomo1" keys, since the calibration is
+    meaningless without the paired independent-noise observations.
+    """
+    if batches is None:
+        batches = 1 * len(dataloader)
+    sq_means = []
+    bar = (
+        tqdm.tqdm(range(batches), desc="Computing data_consistency_loss eps")
+        if verbose
+        else range(batches)
+    )
+    iter_loader = iter(dataloader)
+    for _ in bar:
+        try:
+            batch = next(iter_loader)
+        except StopIteration:
+            iter_loader = iter(dataloader)
+            batch = next(iter_loader)
+        noise = batch["subtomo0"] - batch["subtomo1"]
+        noise_ft = torch.fft.rfftn(noise, dim=(-3, -2, -1), norm="ortho")
+        sq_means.append(noise_ft.abs().pow(2).mean())
+    mean_sq = torch.stack(sq_means).mean()
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        if torch.cuda.is_available():
+            mean_sq = mean_sq.cuda()
+        torch.distributed.all_reduce(mean_sq, op=torch.distributed.ReduceOp.SUM)
+        mean_sq /= torch.distributed.get_world_size()
+    return (mean_sq.cpu().item() ** 0.5) / (2**0.5)

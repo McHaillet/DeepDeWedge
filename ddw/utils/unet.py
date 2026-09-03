@@ -6,10 +6,12 @@ import yaml
 from torch import nn
 
 from .fourier import apply_fourier_mask_to_tomo
-from .losses import cross_consistency_loss, data_consistency_loss, equivariance_loss
-from .normalization import get_avg_model_input_mean_and_std_from_dataloader
+from .losses import data_consistency_loss, equivariance_loss
+from .normalization import (
+    get_avg_dc_loss_eps_from_dataloader,
+    get_avg_model_input_mean_and_std_from_dataloader,
+)
 from .rotation import rotate_vol, sample_grid_rotation
-from .subtomos import get_hann_edge_weights
 
 
 class LitUnet3D(pl.LightningModule):
@@ -23,32 +25,20 @@ class LitUnet3D(pl.LightningModule):
         adam_params,
         subtomo_size,
         lambda_=2.0,
-        mu_=1.0,
-        edge_taper_width=4,
     ):
         super().__init__()
         self.unet_params = unet_params
         self.adam_params = adam_params
         self.subtomo_size = subtomo_size
         self.lambda_ = lambda_
-        self.mu_ = mu_
-        self.edge_taper_width = edge_taper_width
         self.unet = Unet3D(**self.unet_params)
         # self.ema = ExponentialMovingAverage(self.unet.parameters(), decay=0.995)
         self.save_hyperparameters()
 
-        # real-space per-voxel weight down-weighting the outermost 'edge_taper_width' voxels
-        # in all three losses (less reliable: less receptive-field context, zero-padding
-        # boundary effects at every conv layer). A fixed function of position only (see
-        # get_hann_edge_weights), identical for every sample/batch/epoch, so it's computed
-        # once here rather than in _step. persistent=False: it's fully determined by
-        # subtomo_size/edge_taper_width (both already in hparams), so it's cheaply
-        # recomputed on load rather than bloating checkpoints.
-        self.register_buffer(
-            "edge_weight",
-            get_hann_edge_weights(subtomo_size, self.edge_taper_width).float(),
-            persistent=False,
-        )
+        # placeholder until update_dc_loss_eps calibrates it in on_train_start; a real
+        # (persistent) buffer since, unlike edge_weight, it's an estimated statistic that
+        # must round-trip through checkpoints rather than being recomputed on load.
+        self.register_buffer("dc_loss_eps", torch.tensor(1.0))
 
     def forward(self, x):
         return self.unet(x.unsqueeze(1)).squeeze(
@@ -105,14 +95,7 @@ class LitUnet3D(pl.LightningModule):
                 x_hat_target = self(subtomo0)
 
         y_cross = subtomo1 if use_branch0_as_source else subtomo0
-        dc_loss = data_consistency_loss(x_hat_source, y_cross, ctf, weight=self.edge_weight)
-
-        # cross-branch consistency: the model's two independent-noise estimates of the same
-        # physical region should agree with each other, especially where dc_loss's own
-        # ctf^2-weighted constraint is weak (see cross_consistency_loss)
-        cc_loss = cross_consistency_loss(
-            x_hat_source, x_hat_target.detach(), ctf, edge_weight=self.edge_weight
-        )
+        dc_loss = data_consistency_loss(x_hat_source, y_cross, ctf, eps=self.dc_loss_eps)
 
         # sampled once and reused for both the forward and inverse rotation below, so they
         # are guaranteed to exactly cancel (see _sample_rotations)
@@ -125,15 +108,13 @@ class LitUnet3D(pl.LightningModule):
         z = apply_fourier_mask_to_tomo(x_hat_source_rot, ctf)
         x_double_hat = self(z)
         x_double_hat_unrot = self._rotate_batch(x_double_hat, rot_mats, inverse=True)
-        eq_loss = equivariance_loss(
-            x_double_hat_unrot, x_hat_target.detach(), ctf, edge_weight=self.edge_weight
-        )
+        eq_loss = equivariance_loss(x_double_hat_unrot, x_hat_target.detach(), ctf)
 
-        loss = dc_loss + self.lambda_ * eq_loss + self.mu_ * cc_loss
-        return loss, dc_loss, eq_loss, cc_loss
+        loss = dc_loss + self.lambda_ * eq_loss
+        return loss, dc_loss, eq_loss
 
     def training_step(self, batch, batch_idx):
-        loss, dc_loss, eq_loss, cc_loss = self._step(batch, batch_idx, deterministic=False)
+        loss, dc_loss, eq_loss = self._step(batch, batch_idx, deterministic=False)
         # sync_dist=True: under multi-GPU DDP each rank only sees its own shard, so without
         # this the ModelCheckpoint callbacks that monitor "fitting_loss"/"val_loss" (see
         # fit_model.py) would select checkpoints based on a single rank's partial view of
@@ -141,15 +122,13 @@ class LitUnet3D(pl.LightningModule):
         self.log("fitting_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         self.log("fitting_dc_loss", dc_loss, on_step=False, on_epoch=True, logger=True, sync_dist=True)
         self.log("fitting_eq_loss", eq_loss, on_step=False, on_epoch=True, logger=True, sync_dist=True)
-        self.log("fitting_cc_loss", cc_loss, on_step=False, on_epoch=True, logger=True, sync_dist=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss, dc_loss, eq_loss, cc_loss = self._step(batch, batch_idx, deterministic=True)
+        loss, dc_loss, eq_loss = self._step(batch, batch_idx, deterministic=True)
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         self.log("val_dc_loss", dc_loss, on_step=False, on_epoch=True, logger=True, sync_dist=True)
         self.log("val_eq_loss", eq_loss, on_step=False, on_epoch=True, logger=True, sync_dist=True)
-        self.log("val_cc_loss", cc_loss, on_step=False, on_epoch=True, logger=True, sync_dist=True)
 
     # def on_before_zero_grad(self, optimizer) -> None:
     #     self.ema.update()
@@ -157,6 +136,7 @@ class LitUnet3D(pl.LightningModule):
     def on_train_start(self) -> None:
         if self.current_epoch == 0:
             self.update_normalization()
+            self.update_dc_loss_eps()
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), **self.adam_params)
@@ -184,6 +164,17 @@ class LitUnet3D(pl.LightningModule):
         self.update_hparam("unet_params", self.unet_params)
         self.log("normalization/loc", loc)
         self.log("normalization/scale", scale)
+
+    def update_dc_loss_eps(self):
+        """
+        Calibrates data_consistency_loss's Charbonnier 'eps' threshold from the training
+        data's own noise scale (see get_avg_dc_loss_eps_from_dataloader).
+        """
+        eps = get_avg_dc_loss_eps_from_dataloader(
+            dataloader=self.trainer.train_dataloader, verbose=True
+        )
+        self.dc_loss_eps = torch.tensor(eps, device=self.dc_loss_eps.device)
+        self.log("dc_loss_eps", eps)
 
     def update_hparam(self, hparam, value):
         """

@@ -5,11 +5,7 @@ no GPU needed.
 import torch
 
 from ddw.utils.fourier import apply_fourier_mask_to_tomo
-from ddw.utils.losses import (
-    cross_consistency_loss,
-    data_consistency_loss,
-    equivariance_loss,
-)
+from ddw.utils.losses import data_consistency_loss, equivariance_loss
 
 
 def test_data_consistency_loss_zero_for_perfect_cross_reconstruction():
@@ -64,38 +60,18 @@ def test_data_consistency_loss_ignores_zero_ctf_frequencies():
     assert torch.allclose(loss_a, loss_b, atol=1e-4)
 
 
-def test_data_consistency_loss_weight_matches_manual_computation():
+def test_data_consistency_loss_matches_manual_charbonnier_fourier_residual():
     torch.manual_seed(0)
     N = 8
     ctf = torch.rand(N, N, N // 2 + 1).clamp(0, 1)
     x_hat = torch.randn(N, N, N)
     y = torch.randn(N, N, N)
-    weight = torch.rand(N, N, N)
-    expected = (weight * (apply_fourier_mask_to_tomo(x_hat, ctf) - y).pow(2)).mean()
-    assert torch.allclose(data_consistency_loss(x_hat, y, ctf, weight=weight), expected)
-
-
-def test_data_consistency_loss_weight_zero_ignores_residual_there():
-    """
-    A voxel weighted to zero must not affect the loss, however wrong the (cross-wise) target
-    is there. Perturbing 'y' (rather than 'x_hat') at that voxel isolates the change to
-    exactly that residual entry, since 'y' enters the loss un-transformed (elementwise, in
-    real space) - unlike 'x_hat', which is re-masked through a full FFT/mask/IFFT round trip
-    first, so a real-space perturbation to it would spread across every voxel.
-    """
-    torch.manual_seed(0)
-    N = 8
-    ctf = torch.rand(N, N, N // 2 + 1).clamp(0, 1)
-    x_hat = torch.randn(N, N, N)
-    y = torch.randn(N, N, N)
-    weight = torch.ones(N, N, N)
-    weight[0, 0, 0] = 0.0
-
-    loss_a = data_consistency_loss(x_hat, y, ctf, weight=weight)
-    y_perturbed = y.clone()
-    y_perturbed[0, 0, 0] += 100.0
-    loss_b = data_consistency_loss(x_hat, y_perturbed, ctf, weight=weight)
-    assert torch.allclose(loss_a, loss_b)
+    eps = 0.3
+    diff = apply_fourier_mask_to_tomo(x_hat, ctf) - y
+    diff_ft = torch.fft.rfftn(diff, dim=(-3, -2, -1), norm="ortho")
+    residual = diff_ft.abs()
+    expected = (torch.sqrt(residual**2 + eps**2) - eps).mean()
+    assert torch.allclose(data_consistency_loss(x_hat, y, ctf, eps=eps), expected)
 
 
 def test_equivariance_loss_zero_when_identical():
@@ -112,7 +88,7 @@ def test_equivariance_loss_matches_manual_fourier_mse():
     a = torch.randn(4, N, N, N)
     b = torch.randn(4, N, N, N)
     diff_ft = torch.fft.rfftn(a - b, dim=(-3, -2, -1), norm="ortho")
-    expected = (mask * diff_ft).abs().pow(2).mean()
+    expected = (mask * diff_ft.abs().pow(2)).mean()
     assert torch.allclose(equivariance_loss(a, b, mask), expected)
 
 
@@ -135,111 +111,6 @@ def test_equivariance_loss_ignores_zero_mask_frequencies():
     delta = torch.fft.irfftn(delta_freq, s=(N, N, N), norm="ortho")
     loss_ab_perturbed = equivariance_loss(a + delta, b, mask)
     assert torch.allclose(loss_ab, loss_ab_perturbed, atol=1e-4)
-
-
-def test_equivariance_loss_edge_weight_matches_manual_computation():
-    """
-    'edge_weight' is a real-space weight applied to the difference *before* the FFT (there's
-    no real-space step left after it, unlike data_consistency_loss).
-    """
-    torch.manual_seed(0)
-    N = 8
-    mask = torch.rand(N, N, N // 2 + 1).clamp(0, 1)
-    a = torch.randn(N, N, N)
-    b = torch.randn(N, N, N)
-    edge_weight = torch.rand(N, N, N)
-    diff_ft = torch.fft.rfftn(edge_weight * (a - b), dim=(-3, -2, -1), norm="ortho")
-    expected = (mask * diff_ft).abs().pow(2).mean()
-    assert torch.allclose(equivariance_loss(a, b, mask, edge_weight=edge_weight), expected)
-
-
-def test_equivariance_loss_edge_weight_zero_voxel_has_no_effect_in_real_space_before_fft():
-    """
-    A voxel weighted to zero is removed from the difference *before* the FFT, so perturbing
-    'target' there (before edge_weight is applied) must not change the loss - unlike a
-    perturbation to a bin already in Fourier space, which would spread across all voxels.
-    """
-    torch.manual_seed(0)
-    N = 8
-    mask = torch.rand(N, N, N // 2 + 1).clamp(0, 1)
-    a = torch.randn(N, N, N)
-    b = torch.randn(N, N, N)
-    edge_weight = torch.ones(N, N, N)
-    edge_weight[0, 0, 0] = 0.0
-
-    loss_a = equivariance_loss(a, b, mask, edge_weight=edge_weight)
-    b_perturbed = b.clone()
-    b_perturbed[0, 0, 0] += 100.0
-    loss_b = equivariance_loss(a, b_perturbed, mask, edge_weight=edge_weight)
-    assert torch.allclose(loss_a, loss_b)
-
-
-def test_cross_consistency_loss_zero_when_identical():
-    torch.manual_seed(0)
-    ctf = torch.rand(6, 6, 4).clamp(0, 1)
-    x = torch.randn(4, 6, 6, 6)
-    assert cross_consistency_loss(x, x, ctf).item() == 0.0
-
-
-def test_cross_consistency_loss_matches_manual_weighted_power_spectrum():
-    torch.manual_seed(0)
-    N = 8
-    ctf = torch.rand(N, N, N // 2 + 1).clamp(0, 1)
-    x0_hat = torch.randn(4, N, N, N)
-    x1_hat = torch.randn(4, N, N, N)
-    diff_ft = torch.fft.rfftn(x0_hat - x1_hat, dim=(-3, -2, -1), norm="ortho")
-    expected = ((1 - ctf**2) * diff_ft.abs().pow(2)).mean()
-    assert torch.allclose(cross_consistency_loss(x0_hat, x1_hat, ctf), expected)
-
-
-def test_cross_consistency_loss_ignores_frequencies_where_ctf_is_one():
-    """
-    Where 'ctf' is exactly 1, the (1-ctf^2) weight is exactly 0, so disagreement between
-    x0_hat and x1_hat there must not affect the loss - dc_loss already fully constrains that
-    frequency, so this term shouldn't also compete there.
-    """
-    torch.manual_seed(0)
-    N = 8
-    ctf = torch.zeros(N, N, N // 2 + 1)
-    ctf[:, :, : N // 4] = 1.0  # fully trusted band
-
-    x0_hat = torch.randn(N, N, N)
-    x1_hat = torch.randn(N, N, N)
-    loss_a = cross_consistency_loss(x0_hat, x1_hat, ctf)
-
-    delta_freq = torch.fft.rfftn(torch.randn(N, N, N), norm="ortho") * ctf
-    delta = torch.fft.irfftn(delta_freq, s=(N, N, N), norm="ortho")
-    loss_b = cross_consistency_loss(x0_hat + delta, x1_hat, ctf)
-    assert torch.allclose(loss_a, loss_b, atol=1e-4)
-
-
-def test_cross_consistency_loss_fully_active_where_ctf_is_zero():
-    """
-    Where 'ctf' is exactly 0, the (1-ctf^2) weight is exactly 1 - dc_loss gives that
-    frequency ~no constraint, so this term should apply full weight there.
-    """
-    torch.manual_seed(0)
-    N = 8
-    ctf = torch.zeros(N, N, N // 2 + 1)
-    x0_hat = torch.randn(N, N, N)
-    x1_hat = torch.randn(N, N, N)
-    diff_ft = torch.fft.rfftn(x0_hat - x1_hat, dim=(-3, -2, -1), norm="ortho")
-    expected = diff_ft.abs().pow(2).mean()
-    assert torch.allclose(cross_consistency_loss(x0_hat, x1_hat, ctf), expected)
-
-
-def test_cross_consistency_loss_edge_weight_matches_manual_computation():
-    torch.manual_seed(0)
-    N = 8
-    ctf = torch.rand(N, N, N // 2 + 1).clamp(0, 1)
-    x0_hat = torch.randn(N, N, N)
-    x1_hat = torch.randn(N, N, N)
-    edge_weight = torch.rand(N, N, N)
-    diff_ft = torch.fft.rfftn(edge_weight * (x0_hat - x1_hat), dim=(-3, -2, -1), norm="ortho")
-    expected = ((1 - ctf**2) * diff_ft.abs().pow(2)).mean()
-    assert torch.allclose(
-        cross_consistency_loss(x0_hat, x1_hat, ctf, edge_weight=edge_weight), expected
-    )
 
 
 def test_equivariance_loss_scale_matches_real_space_mse():

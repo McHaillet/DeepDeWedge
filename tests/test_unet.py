@@ -6,7 +6,6 @@ import random
 
 import torch
 
-from ddw.utils.subtomos import get_hann_edge_weights
 from ddw.utils.unet import LitUnet3D
 
 
@@ -53,9 +52,9 @@ def test_rotate_batch_round_trips_with_shared_rot_mats_when_non_deterministic():
     assert torch.allclose(back, vol)
 
 
-def test_step_combines_dc_eq_cc_losses_weighted_by_lambda_and_mu():
+def test_step_combines_dc_and_eq_losses_weighted_by_lambda():
     torch.manual_seed(0)
-    lit_unet = _make_lit_unet(lambda_=2.0, mu_=3.0)
+    lit_unet = _make_lit_unet(lambda_=2.0)
     N = 8
     batch = {
         "subtomo0": torch.randn(2, N, N, N),
@@ -63,35 +62,9 @@ def test_step_combines_dc_eq_cc_losses_weighted_by_lambda_and_mu():
         "ctf": torch.rand(2, N, N, N // 2 + 1).clamp(0, 1),
         "index": [0, 1],
     }
-    loss, dc_loss, eq_loss, cc_loss = lit_unet._step(batch, batch_idx=0, deterministic=True)
-    assert torch.allclose(loss, dc_loss + 2.0 * eq_loss + 3.0 * cc_loss)
-    for term in (loss, dc_loss, eq_loss, cc_loss):
+    loss, dc_loss, eq_loss = lit_unet._step(batch, batch_idx=0, deterministic=True)
+    assert torch.allclose(loss, dc_loss + 2.0 * eq_loss)
+    for term in (loss, dc_loss, eq_loss):
         assert torch.isfinite(term)
-    # cc_loss's gradient must flow through x_hat_source (not fully detached on both sides,
-    # or the cross-branch term couldn't actually train anything)
-    assert cc_loss.requires_grad
-
-
-def test_edge_weight_buffer_matches_hann_weights_and_is_cached():
-    """
-    edge_weight must be computed once in __init__ (a fixed function of subtomo_size/
-    edge_taper_width, identical for every sample/batch/epoch) and reused as-is by _step, not
-    recomputed per loss evaluation - i.e. it's a plain registered buffer, not a method.
-    """
-    lit_unet = _make_lit_unet()  # default edge_taper_width=4
-    expected = get_hann_edge_weights(8, 4).float()
-    assert torch.allclose(lit_unet.edge_weight, expected)
-    assert "edge_weight" in dict(lit_unet.named_buffers())
-    # persistent=False: cheaply recomputed from hparams on load rather than stored on disk
-    assert "edge_weight" not in lit_unet.state_dict()
-
-
-def test_edge_taper_width_is_configurable():
-    lit_unet = _make_lit_unet(edge_taper_width=2)
-    expected = get_hann_edge_weights(8, 2).float()
-    assert torch.allclose(lit_unet.edge_weight, expected)
-
-
-def test_edge_taper_width_zero_disables_edge_weighting():
-    lit_unet = _make_lit_unet(edge_taper_width=0)
-    assert torch.equal(lit_unet.edge_weight, torch.ones(8, 8, 8))
+    # dc_loss's gradient must flow through x_hat_source
+    assert dc_loss.requires_grad
