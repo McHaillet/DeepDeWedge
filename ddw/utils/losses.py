@@ -26,7 +26,7 @@ def data_consistency_loss(x_hat, y, ctf):
     return residual_sq.mean()
 
 
-def equivariance_loss(x_double_hat, target):
+def equivariance_loss(x_double_hat, target, mask, norm="ortho"):
     """
     Equivariant-imaging-style self-consistency loss, cross-paired the same way as
     data_consistency_loss: the caller rotates and re-masks (with the canonical, native-
@@ -43,12 +43,30 @@ def equivariance_loss(x_double_hat, target):
     independent-noise estimate, rather than merely learning to undo its own rotation+ctf
     round-trip.
 
-    Plain MSE between 'x_double_hat' and 'target', matching the original equivariant-imaging
-    formulation - no Fourier-domain CTF weighting.
+    'mask' (the same 'ctf' used everywhere else) is used purely as a Fourier-domain
+    reliability weight for the comparison here - unlike the ctf application that builds the
+    model's input upstream of this loss, it is never applied as a forward measurement
+    operator. It's fine for 'mask''s own (rotation-invariant) zero-crossings to stay unfilled:
+    there's no real data there in either representation, and weighting the comparison by
+    'mask' means this loss doesn't force them to be recovered. Applied linearly to the squared
+    residual (mask * |diff_ft|^2, not (mask*diff_ft)'s squared magnitude, which would double
+    up to mask^2) - unlike data_consistency_loss's ctf^2, an emergent side effect of chain-
+    ruling ctf through MSE, this weight is explicit and chosen directly, so it's applied at
+    the exponent it's meant to carry rather than incidentally squared.
 
     Both 'x_double_hat' and 'target' must be constructed from detached estimates by the
     caller - a standard equivariant-imaging stop-gradient, not a limitation of rotate_vol
     (which is itself differentiable). This loss's gradient therefore only flows through the
     *second* application of the model (the one producing 'x_double_hat').
+
+    The FFT uses the same rfftn/'norm="ortho"' convention as apply_fourier_mask_to_tomo. With
+    an orthonormal transform, Parseval's theorem makes sum(|rfftn(diff)|^2) approximately half
+    of sum(|diff|^2) (rfftn keeps only about half the full spectrum, dropping the redundant
+    conjugate-symmetric half), and the rfftn grid has approximately half as many entries as
+    the real-space volume too - so '.mean()' over the (masked) frequency-domain elements lands
+    on the same scale as the real-space MSE used by data_consistency_loss, with no extra
+    scaling factor needed.
     """
-    return (x_double_hat - target).pow(2).mean()
+    diff = x_double_hat - target
+    diff_ft = torch.fft.rfftn(diff, dim=(-3, -2, -1), norm=norm)
+    return (mask * diff_ft.abs().pow(2)).mean()

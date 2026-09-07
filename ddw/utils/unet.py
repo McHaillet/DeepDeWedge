@@ -101,7 +101,7 @@ class LitUnet3D(pl.LightningModule):
         z = apply_fourier_mask_to_tomo(x_hat_source_rot, ctf)
         x_double_hat = self(z)
         x_double_hat_unrot = self._rotate_batch(x_double_hat, rot_mats, inverse=True)
-        eq_loss = equivariance_loss(x_double_hat_unrot, x_hat_target.detach())
+        eq_loss = equivariance_loss(x_double_hat_unrot, x_hat_target.detach(), ctf)
 
         loss = dc_loss + self.lambda_ * eq_loss
         return loss, dc_loss, eq_loss

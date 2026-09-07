@@ -77,6 +77,12 @@ def fit_model(
             help="Weight of the equivariance loss term relative to the data-consistency loss term: total loss = data_consistency_loss + lambda * equivariance_loss."
         ),
     ] = 2.0,
+    gradient_clip_val: Annotated[
+        float,
+        typer.Option(
+            help="Clip gradients to this max norm before each optimizer step, to guard against instability from the self-referential equivariance loss. Set to 0 to disable."
+        ),
+    ] = 1.0,
     logger: Annotated[
         str,
         typer.Option(
@@ -255,6 +261,7 @@ def fit_model(
         logger=logger,
         callbacks=callbacks,
         detect_anomaly=True,
+        gradient_clip_val=gradient_clip_val,
         resume_from_checkpoint=resume_from_checkpoint,  # for pytorch-lightning < 2.0
     )
 
