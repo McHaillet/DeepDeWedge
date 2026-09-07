@@ -98,18 +98,10 @@ class LitUnet3D(pl.LightningModule):
         # eq_loss should only flow through the second application of self() below
         x_hat_source_rot = self._rotate_batch(x_hat_source.detach(), rot_mats)
 
-        # re-inject noise before the second pass, so its input isn't unrealistically clean
-        # (out-of-distribution vs. what the model normally sees). Rather than modeling the
-        # noise, transplant a real sample of it: (subtomo0-subtomo1)/sqrt(2) is an exact draw
-        # from the true per-sample noise (right spectral shape, right wedge, no assumptions
-        # needed), shuffled across the batch so it doesn't correlate with this sample's own
-        # dc_loss target.
-        raw_noise = (subtomo0 - subtomo1) / 2**0.5
-        donor_noise = raw_noise[torch.randperm(raw_noise.shape[0])]
-        z = apply_fourier_mask_to_tomo(x_hat_source_rot, ctf) + donor_noise
+        z = apply_fourier_mask_to_tomo(x_hat_source_rot, ctf)
         x_double_hat = self(z)
         x_double_hat_unrot = self._rotate_batch(x_double_hat, rot_mats, inverse=True)
-        eq_loss = equivariance_loss(x_double_hat_unrot, x_hat_target.detach(), ctf)
+        eq_loss = equivariance_loss(x_double_hat_unrot, x_hat_target.detach())
 
         loss = dc_loss + self.lambda_ * eq_loss
         return loss, dc_loss, eq_loss
