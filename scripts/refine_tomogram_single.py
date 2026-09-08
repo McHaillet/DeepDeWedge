@@ -26,13 +26,16 @@ for its equivariance loss during fitting (minus the rotation), rather than
 just running f once on each of y0/y1 and averaging.
 
 Refined subtomograms are placed back into the output tomogram with
-nearest-center (Voronoi) assignment - see
+nearest-center (Voronoi) assignment by default - see
 ddw.utils.subtomos.reassemble_subtomos_nearest_center - not a blend of all
 overlapping subtomos: subtomos are less reliable towards their own
 edges/corners (e.g. correct_attenuation's sinc^2 correction grows with
 distance from the reconstruction center), and blending several such
 edge-degraded samples together compounds that degradation rather than
-cancelling it. Since each subtomogram is reconstructed at a sub-voxel-precise
+cancelling it. `--reassembly-method linear-ramp` opts into blending instead
+(ddw.utils.subtomos.reassemble_subtomos + get_linear_ramp_weights), which
+can look smoother across seams at the cost of re-mixing in that edge
+degradation. Since each subtomogram is reconstructed at a sub-voxel-precise
 physical position (independent per-position backprojection, not cropped from
 one pre-existing voxel grid), placement is necessarily an approximation: each
 subtomogram is dropped into the output tomogram at its *nearest* integer
@@ -73,13 +76,13 @@ from warpylib.ops import preprocess_tilt_data
 from ddw.fit_model import LitUnet3D
 from ddw.utils.fourier import apply_fourier_mask_to_tomo
 from ddw.utils.mrctools import save_mrc_data
-from ddw.utils.subtomos import reassemble_subtomos_nearest_center
+from ddw.utils.subtomos import reassemble_subtomos, reassemble_subtomos_nearest_center
 
 
-def make_grid_positions(volume_dims: torch.Tensor, box_physical: float, overlap: float) -> torch.Tensor:
+def make_grid_axis_centers(volume_dims: torch.Tensor, box_physical: float, overlap: float) -> list:
     """
-    Evenly spaced box-center coordinates (Angstrom) that cover volume_dims
-    along each axis, with neighboring boxes overlapping by at least `overlap`.
+    Per-axis, evenly spaced box-center coordinates (Angstrom) that cover volume_dims,
+    with neighboring boxes overlapping by at least `overlap`.
     """
     step = box_physical * (1.0 - overlap)
     axis_centers = []
@@ -90,7 +93,26 @@ def make_grid_positions(volume_dims: torch.Tensor, box_physical: float, overlap:
             n = math.ceil((length - box_physical) / step) + 1
             centers = torch.linspace(box_physical / 2.0, length - box_physical / 2.0, n)
         axis_centers.append(centers)
-    return torch.cartesian_prod(*axis_centers).reshape(-1, 3)
+    return axis_centers
+
+
+def axis_overlap_voxels(axis_centers: list, box_physical: float, pixel_size: float) -> list:
+    """
+    Actual overlap (in voxels) between neighboring grid boxes along each axis, derived from
+    the real spacing between `axis_centers` rather than the nominal --overlap target: since
+    the number of grid positions per axis is rounded up (see make_grid_axis_centers), the
+    true spacing is often tighter than the nominal step, so the true overlap is >= the
+    requested --overlap. get_linear_ramp_weights needs the true value - too narrow a ramp
+    covers only part of the actual overlap and leaves a visible seam at every grid line.
+    """
+    overlaps = []
+    for centers in axis_centers:
+        if centers.numel() < 2:
+            overlaps.append(0)
+        else:
+            spacing = (centers[1] - centers[0]).item()
+            overlaps.append(max(0, round((box_physical - spacing) / pixel_size)))
+    return overlaps
 
 
 def main() -> None:
@@ -101,6 +123,7 @@ def main() -> None:
     parser.add_argument("--model-checkpoint", type=Path, required=True, help="Path to a DeepDeWedge model checkpoint (.ckpt)")
     parser.add_argument("--output-file", type=Path, required=True, help="Path to save the refined tomogram (.mrc)")
     parser.add_argument("--overlap", type=float, default=0.5, help="Minimum fractional overlap between neighboring grid positions, relative to --box-size (default: 0.5)")
+    parser.add_argument("--reassembly-method", type=str, choices=["nearest-center", "linear-ramp"], default="nearest-center", help="How to combine overlapping refined subtomograms into the output tomogram. 'nearest-center' (default) assigns each voxel to its closest-center subtomogram - no blending, so it doesn't compound the edge/corner reconstruction degradation described above. 'linear-ramp' blends overlaps with linear-ramp edge weights (ddw.utils.subtomos.get_linear_ramp_weights), which can look smoother across seams but re-mixes in that edge degradation")
     parser.add_argument("--oversampling", type=float, default=3.0, help="Oversampling passed to reconstruct_subvolumes_single/reconstruct_subvolume_ctfs_single. Backprojects from a --box-size * --oversampling patch and crops back to --box-size, which gentles correct_attenuation's sinc^2 correction (it grows sharply towards each box's own corners) - too low a value leaves every subtomo's corners/edges visibly boosted (default: 3.0, vs. reconstruct_subvolumes_single's own default of 2.0)")
     parser.add_argument("--device", type=str, default="cpu", help="torch device to reconstruct and run the model on, e.g. 'cpu', 'cuda', 'cuda:0' (default: cpu)")
     parser.add_argument("--batch-size", type=int, default=None, help="Max grid positions reconstructed and refined in a single batch; splits large tomograms into chunks to bound memory use (default: no chunking)")
@@ -115,7 +138,8 @@ def main() -> None:
     box_physical = args.box_size * args.pixel_size
 
     ts = TiltSeries(str(args.xml_file)).to(device)
-    positions = make_grid_positions(ts.volume_dimensions_physical, box_physical, args.overlap)
+    axis_centers = make_grid_axis_centers(ts.volume_dimensions_physical, box_physical, args.overlap)
+    positions = torch.cartesian_prod(*axis_centers).reshape(-1, 3)
     print(f"{args.xml_file.name}: {positions.shape[0]} positions")
 
     # load_images always returns CPU tensors (mrcfile reads), so move them onto
@@ -180,11 +204,22 @@ def main() -> None:
     start_coords = start_coords.flip(-1)
     tomo_shape = tomo_shape.flip(-1)
 
-    tomo = reassemble_subtomos_nearest_center(
-        subtomos=refined_subtomos,
-        subtomo_start_coords=start_coords.tolist(),
-        crop_to_size=tomo_shape.tolist(),
-    )
+    if args.reassembly_method == "nearest-center":
+        tomo = reassemble_subtomos_nearest_center(
+            subtomos=refined_subtomos,
+            subtomo_start_coords=start_coords.tolist(),
+            crop_to_size=tomo_shape.tolist(),
+        )
+    else:
+        # axis_centers/overlap_voxels are ordered X,Y,Z like ts.volume_dimensions_physical;
+        # flip to Z,Y,X to match the subtomo tensors' own axis order (see comment above).
+        overlap_voxels = axis_overlap_voxels(axis_centers, box_physical, args.pixel_size)[::-1]
+        tomo = reassemble_subtomos(
+            subtomos=refined_subtomos,
+            subtomo_start_coords=start_coords.tolist(),
+            subtomo_overlap=overlap_voxels,
+            crop_to_size=tomo_shape.tolist(),
+        )
 
     print(f"Reassembled {len(refined_subtomos)} refined subvolume(s) into a tomogram of shape {tuple(tomo.shape)}.")
     print(f"Saving to '{args.output_file}'.")
