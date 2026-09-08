@@ -32,8 +32,8 @@ overlapping subtomos: subtomos are less reliable towards their own
 edges/corners (e.g. correct_attenuation's sinc^2 correction grows with
 distance from the reconstruction center), and blending several such
 edge-degraded samples together compounds that degradation rather than
-cancelling it. `--reassembly-method linear-ramp` opts into blending instead
-(ddw.utils.subtomos.reassemble_subtomos + get_linear_ramp_weights), which
+cancelling it. `--reassembly-method hann-ramp` opts into blending instead
+(ddw.utils.subtomos.reassemble_subtomos + get_hann_ramp_weights), which
 can look smoother across seams at the cost of re-mixing in that edge
 degradation. Since each subtomogram is reconstructed at a sub-voxel-precise
 physical position (independent per-position backprojection, not cropped from
@@ -102,7 +102,7 @@ def axis_overlap_voxels(axis_centers: list, box_physical: float, pixel_size: flo
     the real spacing between `axis_centers` rather than the nominal --overlap target: since
     the number of grid positions per axis is rounded up (see make_grid_axis_centers), the
     true spacing is often tighter than the nominal step, so the true overlap is >= the
-    requested --overlap. get_linear_ramp_weights needs the true value - too narrow a ramp
+    requested --overlap. get_hann_ramp_weights needs the true value - too narrow a ramp
     covers only part of the actual overlap and leaves a visible seam at every grid line.
     """
     overlaps = []
@@ -123,7 +123,7 @@ def main() -> None:
     parser.add_argument("--model-checkpoint", type=Path, required=True, help="Path to a DeepDeWedge model checkpoint (.ckpt)")
     parser.add_argument("--output-file", type=Path, required=True, help="Path to save the refined tomogram (.mrc)")
     parser.add_argument("--overlap", type=float, default=0.5, help="Minimum fractional overlap between neighboring grid positions, relative to --box-size (default: 0.5)")
-    parser.add_argument("--reassembly-method", type=str, choices=["nearest-center", "linear-ramp"], default="nearest-center", help="How to combine overlapping refined subtomograms into the output tomogram. 'nearest-center' (default) assigns each voxel to its closest-center subtomogram - no blending, so it doesn't compound the edge/corner reconstruction degradation described above. 'linear-ramp' blends overlaps with linear-ramp edge weights (ddw.utils.subtomos.get_linear_ramp_weights), which can look smoother across seams but re-mixes in that edge degradation")
+    parser.add_argument("--reassembly-method", type=str, choices=["nearest-center", "hann-ramp"], default="nearest-center", help="How to combine overlapping refined subtomograms into the output tomogram. 'nearest-center' (default) assigns each voxel to its closest-center subtomogram - no blending, so it doesn't compound the edge/corner reconstruction degradation described above. 'hann-ramp' blends overlaps with Hann-shaped (raised-cosine) edge weights (ddw.utils.subtomos.get_hann_ramp_weights), which can look smoother across seams but re-mixes in that edge degradation")
     parser.add_argument("--oversampling", type=float, default=3.0, help="Oversampling passed to reconstruct_subvolumes_single/reconstruct_subvolume_ctfs_single. Backprojects from a --box-size * --oversampling patch and crops back to --box-size, which gentles correct_attenuation's sinc^2 correction (it grows sharply towards each box's own corners) - too low a value leaves every subtomo's corners/edges visibly boosted (default: 3.0, vs. reconstruct_subvolumes_single's own default of 2.0)")
     parser.add_argument("--device", type=str, default="cpu", help="torch device to reconstruct and run the model on, e.g. 'cpu', 'cuda', 'cuda:0' (default: cpu)")
     parser.add_argument("--batch-size", type=int, default=None, help="Max grid positions reconstructed and refined in a single batch; splits large tomograms into chunks to bound memory use (default: no chunking)")

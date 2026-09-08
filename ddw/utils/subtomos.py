@@ -57,7 +57,7 @@ def reassemble_subtomos(
     """
     Basically the inverse of 'extract_subtomos'. For this to work, 'extract_subtomos' must have been called with 'pad_before_subtomo_extraction=True', and 'crop_to_size' must be set to the 3D shape of the tomogram from which the sub-tomograms were extracted.
 
-    'subtomo_overlap' is the number of voxels neighboring sub-tomograms actually overlap by, used to size the linear blending ramp at each box edge (see 'get_linear_ramp_weights'); it must match the real grid spacing, not just a nominal target, or the ramp covers only part of the true overlap and leaves a visible seam at every grid line. Pass a single int to use the same width on all three axes, or a (width_0, width_1, width_2) tuple/list if the overlap differs per axis. None disables blending (plain average of overlapping regions).
+    'subtomo_overlap' is the number of voxels neighboring sub-tomograms actually overlap by, used to size the Hann-shaped blending ramp at each box edge (see 'get_hann_ramp_weights'); it must match the real grid spacing, not just a nominal target, or the ramp covers only part of the true overlap and leaves a visible seam at every grid line. Pass a single int to use the same width on all three axes, or a (width_0, width_1, width_2) tuple/list if the overlap differs per axis. None disables blending (plain average of overlapping regions).
     """
     # calculate the max indices in each dimension to infer the shape of the original tomogram
     subtomo_size = subtomos[0].shape[0]
@@ -68,7 +68,7 @@ def reassemble_subtomos(
     if subtomo_overlap is None:
         subtomo_weights = torch.ones_like(subtomos[0])
     else:
-        subtomo_weights = get_linear_ramp_weights(
+        subtomo_weights = get_hann_ramp_weights(
             subtomos[0].shape[0], subtomo_overlap
         ).to(subtomos[0].device)
 
@@ -139,9 +139,18 @@ def reassemble_subtomos_nearest_center(subtomos, subtomo_start_coords, crop_to_s
     return out_vol
 
 
-def get_linear_ramp_weights(subtomo_size, subtomo_overlap):
+def get_hann_ramp_weights(subtomo_size, subtomo_overlap):
     """
-    Produces a cubic 3D tensor containing linear weights used to average overlapping sub-tomogram parts in 'reassemble_subtomos'. 'subtomo_overlap' is a single int (same ramp width on all three axes) or a 3-tuple/list of per-axis ramp widths, axis order matching the subtomo tensor's own axes; a width of 0 disables ramping on that axis (weight 1 everywhere along it).
+    Produces a cubic 3D tensor containing raised-cosine (Hann) weights used to blend
+    overlapping sub-tomogram parts in 'reassemble_subtomos'. 'subtomo_overlap' is a single int
+    (same ramp width on all three axes) or a 3-tuple/list of per-axis ramp widths, axis order
+    matching the subtomo tensor's own axes; a width of 0 disables ramping on that axis (weight
+    1 everywhere along it).
+
+    Unlike a linear ramp, the raised cosine has zero derivative at both ends of the
+    transition (the true edge and where it meets the flat interior) - no slope kink where the
+    ramp meets the flat region, which a linear ramp leaves behind and which can still show up
+    as a faint seam.
     """
     if isinstance(subtomo_overlap, (int, np.integer)):
         subtomo_overlap = 3 * [subtomo_overlap]
@@ -154,7 +163,11 @@ def get_linear_ramp_weights(subtomo_size, subtomo_overlap):
         overlap = min(overlap, subtomo_size // 2)
         weight_map_1d = np.ones(subtomo_size)
         if overlap > 0:
-            ramp = np.linspace(0, 1, overlap) + 1e-6
+            # raised cosine from 0 (outermost voxel) to 1 (at 'overlap' voxels in); denominator
+            # guards overlap=1, where there's only the one, fully-zeroed voxel to place; +1e-6
+            # keeps the outermost voxel's weight nonzero, same as the old linear ramp did, so a
+            # voxel covered by only one sub-tomogram doesn't get a zero-weight (0/0) average
+            ramp = 0.5 * (1 - np.cos(np.pi * np.arange(overlap) / max(overlap - 1, 1))) + 1e-6
             weight_map_1d[:overlap] = ramp  # ramp up at the start
             weight_map_1d[-overlap:] = ramp[::-1]  # and down at the end
         weight_maps_1d.append(weight_map_1d)
